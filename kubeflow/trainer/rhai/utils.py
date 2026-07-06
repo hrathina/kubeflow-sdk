@@ -10,6 +10,7 @@ from kubernetes.client.rest import ApiException
 from kubeflow.trainer.constants import constants
 from kubeflow.trainer.rhai import (
     RHAITrainer,
+    speculator,
     traininghub,
     transformers,
 )
@@ -80,6 +81,13 @@ def get_trainer_cr_from_rhai_trainer(
 
     elif isinstance(trainer, transformers.TransformersTrainer):
         return transformers.get_trainer_cr_from_transformers_trainer(
+            runtime,
+            trainer,
+            initializer,
+        )
+
+    elif isinstance(trainer, speculator.SpeculatorTrainer):
+        return speculator.get_trainer_cr_from_speculator_trainer(
             runtime,
             trainer,
             initializer,
