@@ -425,7 +425,7 @@ def _speculator_data_only(
     endpoint = vllm_endpoint
     print(f"Using vLLM endpoint: {endpoint}", flush=True)
     health = vllm_endpoint.rstrip("/").rsplit("/v1", 1)[0] + "/health"
-    timeout_secs = 300
+    timeout_secs = 600
     start = time.time()
     print(f"Waiting for vLLM server (timeout={timeout_secs}s)...", flush=True)
     while time.time() - start < timeout_secs:
@@ -696,6 +696,11 @@ def _render_speculator_training_script(trainer: SpeculativeDecodingTrainer) -> s
     if needs_train:
         script += textwrap.dedent(inspect.getsource(_speculator_train_only))
 
+    if trainer.verifier_model.startswith(PVC_URI_SCHEME):
+        resolved_verifier_model, _ = parse_output_dir_uri(trainer.verifier_model)
+    else:
+        resolved_verifier_model = trainer.verifier_model
+
     if trainer.dataset_name and trainer.dataset_name.startswith(PVC_URI_SCHEME):
         resolved_dataset_name, _ = parse_output_dir_uri(trainer.dataset_name)
     else:
@@ -715,7 +720,7 @@ def _render_speculator_training_script(trainer: SpeculativeDecodingTrainer) -> s
 
     data_call = (
         f"_speculator_data_only(\n"
-        f"    verifier_model={trainer.verifier_model!r},\n"
+        f"    verifier_model={resolved_verifier_model!r},\n"
         f"    dataset_name={resolved_dataset_name!r},\n"
         f"    save_path={resolved_output_dir!r},\n"
         f"    total_seq_len={trainer.total_seq_len!r},\n"
@@ -727,7 +732,7 @@ def _render_speculator_training_script(trainer: SpeculativeDecodingTrainer) -> s
 
     train_call = (
         f"_speculator_train_only(\n"
-        f"    verifier_model={trainer.verifier_model!r},\n"
+        f"    verifier_model={resolved_verifier_model!r},\n"
         f"    hidden_states_path={resolved_hidden_states!r},\n"
         f"    save_path={resolved_output_dir!r},\n"
         f"    epochs={trainer.epochs!r},\n"
@@ -1214,16 +1219,36 @@ def apply_speculator_sidecar_overrides(
     if "initContainers" not in spec_dict:
         spec_dict["initContainers"] = []
 
+    if trainer.verifier_model.startswith(PVC_URI_SCHEME):
+        resolved_verifier, _ = parse_output_dir_uri(trainer.verifier_model)
+    else:
+        resolved_verifier = trainer.verifier_model
+
+    cfg = trainer.config or SpeculatorConfig()
+    if cfg.target_layer_ids is not None:
+        layer_ids = cfg.target_layer_ids
+    else:
+        from transformers import AutoConfig
+
+        model_config = AutoConfig.from_pretrained(trainer.verifier_model, trust_remote_code=True)
+        if hasattr(model_config, "text_config"):
+            model_config = model_config.text_config
+        n = model_config.num_hidden_layers
+        layer_ids = [2, n // 2, n - 3]
+
+    layer_ids_str = ",".join(str(lid) for lid in layer_ids)
+
     sidecar_override = {
         "name": VLLM_SIDECAR_CONTAINER_NAME,
         "env": [
-            {"name": "SPECULATOR_VERIFIER_MODEL", "value": trainer.verifier_model},
+            {"name": "SPECULATOR_VERIFIER_MODEL", "value": resolved_verifier},
             {"name": "SPECULATOR_HS_PATH", "value": hs_path},
             {
                 "name": "SPECULATOR_GPU_MEM_UTIL",
                 "value": str(trainer.vllm_gpu_memory_utilization),
             },
             {"name": "SPECULATOR_VLLM_GPU_COUNT", "value": str(trainer.vllm_gpu_count)},
+            {"name": "SPECULATOR_TARGET_LAYER_IDS", "value": layer_ids_str},
         ],
         "volumeMounts": [
             {

@@ -498,7 +498,12 @@ def setup_rhai_trainer_storage(
     resolved_output_dir = None
 
     if isinstance(trainer, speculator.SpeculativeDecodingTrainer):
-        all_paths = [trainer.output_dir, trainer.hidden_states_path, trainer.dataset_name]
+        all_paths = [
+            trainer.output_dir,
+            trainer.hidden_states_path,
+            trainer.dataset_name,
+            trainer.verifier_model,
+        ]
         pvc_paths = [p for p in all_paths if p and p.startswith(PVC_URI_SCHEME)]
         pvc_names = {p[len(PVC_URI_SCHEME) :].split("/", 1)[0] for p in pvc_paths}
 

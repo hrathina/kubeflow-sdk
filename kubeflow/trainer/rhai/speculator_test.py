@@ -1522,6 +1522,7 @@ def test_apply_speculator_sidecar_overrides():
         output_dir="pvc://shared/speculator/run1",
         vllm_gpu_count=2,
         vllm_gpu_memory_utilization=0.85,
+        config=SpeculatorConfig(target_layer_ids=[2, 18, 33]),
     )
 
     result = apply_speculator_sidecar_overrides(trainer, [])
@@ -1543,6 +1544,7 @@ def test_apply_speculator_sidecar_overrides():
     )
     assert env_dict["SPECULATOR_GPU_MEM_UTIL"] == "0.85"
     assert env_dict["SPECULATOR_VLLM_GPU_COUNT"] == "2"
+    assert env_dict["SPECULATOR_TARGET_LAYER_IDS"] == "2,18,33"
 
     assert sidecar["volumeMounts"][0]["name"] == "checkpoint-storage"
     assert sidecar["volumeMounts"][0]["mountPath"] == "/mnt/kubeflow-checkpoints"
@@ -1561,6 +1563,7 @@ def test_apply_speculator_sidecar_overrides_preserves_existing():
         mode=SpeculatorMode.DATA_ONLY,
         dataset_name="sharegpt",
         output_dir="pvc://shared/output",
+        config=SpeculatorConfig(target_layer_ids=[2, 18, 33]),
     )
 
     existing = [
@@ -1629,5 +1632,105 @@ def test_offline_script_uses_user_endpoint():
     script = _render_speculator_training_script(trainer)
 
     assert "vllm_endpoint='http://my-vllm:8000/v1'" in script
+
+    print("test execution complete")
+
+
+def test_data_only_script_resolves_pvc_verifier_model():
+    """Test that pvc:// verifier_model is resolved to local path in rendered script."""
+    print("Executing test: DATA_ONLY script resolves pvc:// verifier_model")
+
+    trainer = SpeculativeDecodingTrainer(
+        verifier_model="pvc://shared/models/meta-llama/Llama-3.1-8B-Instruct",
+        mode=SpeculatorMode.DATA_ONLY,
+        dataset_name="sharegpt",
+        output_dir="pvc://shared/datagen_output",
+    )
+
+    script = _render_speculator_training_script(trainer)
+
+    assert (
+        "verifier_model='/mnt/kubeflow-checkpoints/models/meta-llama/Llama-3.1-8B-Instruct'"
+        in script
+    )
+    assert "pvc://" not in script
+
+    print("test execution complete")
+
+
+def test_verifier_model_hf_id_unchanged_in_script():
+    """Test that HuggingFace model ID passes through unchanged in rendered script."""
+    print("Executing test: HF verifier_model unchanged in script")
+
+    trainer = SpeculativeDecodingTrainer(
+        verifier_model="meta-llama/Llama-3.1-8B-Instruct",
+        mode=SpeculatorMode.DATA_ONLY,
+        dataset_name="sharegpt",
+        output_dir="pvc://shared/datagen_output",
+    )
+
+    script = _render_speculator_training_script(trainer)
+
+    assert "verifier_model='meta-llama/Llama-3.1-8B-Instruct'" in script
+
+    print("test execution complete")
+
+
+def test_verifier_model_local_path_unchanged_in_script():
+    """Test that local path verifier_model passes through unchanged in rendered script."""
+    print("Executing test: local path verifier_model unchanged in script")
+
+    trainer = SpeculativeDecodingTrainer(
+        verifier_model="/mnt/models/Llama-3.1-8B-Instruct",
+        mode=SpeculatorMode.DATA_ONLY,
+        dataset_name="sharegpt",
+        output_dir="pvc://shared/datagen_output",
+    )
+
+    script = _render_speculator_training_script(trainer)
+
+    assert "verifier_model='/mnt/models/Llama-3.1-8B-Instruct'" in script
+
+    print("test execution complete")
+
+
+def test_sidecar_overrides_resolves_pvc_verifier_model():
+    """Test that pvc:// verifier_model is resolved in sidecar env var."""
+    print("Executing test: sidecar resolves pvc:// verifier_model")
+
+    trainer = SpeculativeDecodingTrainer(
+        verifier_model="pvc://shared/models/Qwen3-8B",
+        mode=SpeculatorMode.DATA_ONLY,
+        dataset_name="sharegpt",
+        output_dir="pvc://shared/datagen_output",
+        config=SpeculatorConfig(target_layer_ids=[2, 18, 33]),
+    )
+
+    result = apply_speculator_sidecar_overrides(trainer, [])
+
+    sidecar = result[0]["spec"]["initContainers"][0]
+    env_dict = {e["name"]: e["value"] for e in sidecar["env"]}
+    assert env_dict["SPECULATOR_VERIFIER_MODEL"] == "/mnt/kubeflow-checkpoints/models/Qwen3-8B"
+
+    print("test execution complete")
+
+
+def test_sidecar_overrides_passes_target_layer_ids():
+    """Test that target_layer_ids is passed as SPECULATOR_TARGET_LAYER_IDS env var."""
+    print("Executing test: sidecar passes target_layer_ids")
+
+    trainer = SpeculativeDecodingTrainer(
+        verifier_model="/mnt/models/Qwen3-8B",
+        mode=SpeculatorMode.DATA_ONLY,
+        dataset_name="sharegpt",
+        output_dir="pvc://shared/datagen_output",
+        config=SpeculatorConfig(target_layer_ids=[2, 18, 33]),
+    )
+
+    result = apply_speculator_sidecar_overrides(trainer, [])
+
+    sidecar = result[0]["spec"]["initContainers"][0]
+    env_dict = {e["name"]: e["value"] for e in sidecar["env"]}
+    assert env_dict["SPECULATOR_TARGET_LAYER_IDS"] == "2,18,33"
 
     print("test execution complete")
