@@ -147,6 +147,9 @@ class SpeculativeDecodingTrainer:
         vllm_endpoint: URL of user-managed vLLM endpoint for hidden state
             extraction. Used in OFFLINE and DATA_ONLY modes. When ``None``, a managed
             vLLM server is launched automatically.
+        regenerate_responses: When True, send dataset prompts to the verifier model
+            and use its responses instead of the original dataset responses before
+            preprocessing. Only supported in DATA_ONLY mode (default: False).
         enable_progression_tracking: Enable progression tracking (default: True).
         metrics_port: HTTP server port for metrics endpoint (default: 28080).
         metrics_poll_interval_seconds: How often controller polls metrics (default: 30).
@@ -175,6 +178,8 @@ class SpeculativeDecodingTrainer:
     env: dict[str, str] | None = None
     output_dir: str | None = None
     vllm_endpoint: str | None = None
+
+    regenerate_responses: bool = False
 
     enable_progression_tracking: bool = True
     metrics_port: int = 28080
@@ -233,6 +238,9 @@ class SpeculativeDecodingTrainer:
                 raise ValueError(
                     f"max_samples must be a positive integer, got {self.max_samples!r}."
                 )
+
+        if self.regenerate_responses and self.mode != SpeculatorMode.DATA_ONLY:
+            raise ValueError("regenerate_responses is only supported in DATA_ONLY mode.")
 
         if not isinstance(self.epochs, int) or self.epochs < 1:
             raise ValueError(f"epochs must be a positive integer, got {self.epochs!r}.")
@@ -348,6 +356,7 @@ def _speculator_data_only(
     max_samples: int | None = None,
     vllm_endpoint: str = "http://localhost:8234/v1",
     concurrency: int = 4,
+    regenerate_responses: bool = False,
 ) -> None:
     """Data extraction function injected into pods via inspect.getsource().
 
@@ -398,7 +407,76 @@ def _speculator_data_only(
         )
 
     if "_set_phase" in globals():
-        _set_phase("preprocessing", 5)  # noqa: F821
+        _set_phase("checking_vllm", 5)  # noqa: F821
+
+    endpoint = vllm_endpoint
+    print(f"Using vLLM endpoint: {endpoint}", flush=True)
+    health = vllm_endpoint.rstrip("/").rsplit("/v1", 1)[0] + "/health"
+    timeout_secs = 600
+    start = time.time()
+    print(f"Waiting for vLLM server (timeout={timeout_secs}s)...", flush=True)
+    while time.time() - start < timeout_secs:
+        try:
+            urllib.request.urlopen(health, timeout=5)
+            print("vLLM ready", flush=True)
+            break
+        except (urllib.error.URLError, OSError):
+            time.sleep(5)
+    else:
+        sys.exit(f"vLLM endpoint not reachable within {timeout_secs}s")
+
+    if regenerate_responses:
+        from pathlib import Path
+
+        if "_set_phase" in globals():
+            _set_phase("regenerating_responses", 5)  # noqa: F821
+
+        print("=" * 60, flush=True)
+        print("Stage 0: Regenerating responses from verifier", flush=True)
+        print("=" * 60, flush=True)
+
+        regen_dataset_map = {
+            "sharegpt": "magpie",
+            "magpie": "magpie",
+            "ultrachat": "ultrachat",
+            "gsm8k": "gsm8k",
+        }
+        regen_dataset = regen_dataset_map.get(dataset_name, "magpie")
+        regen_output = str(Path(save_path) / "regenerated_responses.jsonl")
+        chat_endpoint = endpoint.rstrip("/").rsplit("/v1", 1)[0] + "/v1/chat/completions"
+
+        regen_script_path = "/tmp/response_regeneration.py"
+        if not os.path.exists(regen_script_path):
+            import base64
+
+            regen_content = base64.b64decode(_REGEN_SCRIPT_B64).decode("utf-8")  # noqa: F821
+            with open(regen_script_path, "w") as f:
+                f.write(regen_content)
+            print(f"Wrote bundled response_regeneration.py to {regen_script_path}", flush=True)
+
+        regen_cmd = [
+            sys.executable,
+            regen_script_path,
+            "--endpoint",
+            chat_endpoint,
+            "--dataset",
+            regen_dataset,
+            "--outfile",
+            regen_output,
+        ]
+        if max_samples is not None:
+            regen_cmd.extend(["--limit", str(max_samples)])
+        print(f"Regen command: {' '.join(regen_cmd)}", flush=True)
+        regen_result = subprocess.run(regen_cmd, capture_output=False)
+        if regen_result.returncode != 0:
+            raise RuntimeError(
+                f"response_regeneration.py exited with code {regen_result.returncode}"
+            )
+        print(f"Responses saved to {regen_output}", flush=True)
+        dataset_name = regen_output
+
+    if "_set_phase" in globals():
+        _set_phase("preprocessing", 10)  # noqa: F821
 
     print("=" * 60, flush=True)
     print("Stage 1: Preprocessing dataset", flush=True)
@@ -421,26 +499,7 @@ def _speculator_data_only(
         _start_data_progress_server(hidden_states_dir, len(dataset))  # noqa: F821
 
     if "_set_phase" in globals():
-        _set_phase("checking_vllm", 10)  # noqa: F821
-
-    endpoint = vllm_endpoint
-    print(f"Using vLLM endpoint: {endpoint}", flush=True)
-    health = vllm_endpoint.rstrip("/").rsplit("/v1", 1)[0] + "/health"
-    timeout_secs = 600
-    start = time.time()
-    print(f"Waiting for vLLM server (timeout={timeout_secs}s)...", flush=True)
-    while time.time() - start < timeout_secs:
-        try:
-            urllib.request.urlopen(health, timeout=5)
-            print("vLLM ready", flush=True)
-            break
-        except (urllib.error.URLError, OSError):
-            time.sleep(5)
-    else:
-        sys.exit(f"vLLM endpoint not reachable within {timeout_secs}s")
-
-    if "_set_phase" in globals():
-        _set_phase("extracting", 10)  # noqa: F821
+        _set_phase("extracting", 15)  # noqa: F821
 
     print("=" * 60, flush=True)
     print("Stage 2: Generating hidden states", flush=True)
@@ -765,6 +824,7 @@ def _render_speculator_training_script(trainer: SpeculativeDecodingTrainer) -> s
         f"    max_samples={trainer.max_samples!r},\n"
         f"    vllm_endpoint={data_vllm_endpoint!r},\n"
         f"    concurrency={cfg.datagen_concurrency!r},\n"
+        f"    regenerate_responses={trainer.regenerate_responses!r},\n"
         f")\n"
     )
 
