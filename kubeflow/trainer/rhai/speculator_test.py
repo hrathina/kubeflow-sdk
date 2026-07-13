@@ -1734,3 +1734,120 @@ def test_sidecar_overrides_passes_target_layer_ids():
     assert env_dict["SPECULATOR_TARGET_LAYER_IDS"] == "2,18,33"
 
     print("test execution complete")
+
+
+def test_train_only_script_passes_data_path():
+    """Test that TRAIN_ONLY script passes user-provided data_path."""
+    print("Executing test: TRAIN_ONLY script passes data_path")
+
+    trainer = SpeculativeDecodingTrainer(
+        verifier_model="Qwen/Qwen3-8B",
+        mode=SpeculatorMode.TRAIN_ONLY,
+        hidden_states_path="/data/hidden_states",
+        data_path="/data/arrow_dataset",
+        output_dir="pvc://test-pvc/output",
+    )
+
+    script = _render_speculator_training_script(trainer)
+
+    assert "data_path='/data/arrow_dataset'" in script
+
+    print("test execution complete")
+
+
+def test_train_only_script_resolves_pvc_data_path():
+    """Test that TRAIN_ONLY script resolves pvc:// data_path to local mount."""
+    print("Executing test: TRAIN_ONLY resolves pvc:// data_path")
+
+    trainer = SpeculativeDecodingTrainer(
+        verifier_model="Qwen/Qwen3-8B",
+        mode=SpeculatorMode.TRAIN_ONLY,
+        hidden_states_path="/data/hidden_states",
+        data_path="pvc://shared/arrow_dataset",
+        output_dir="pvc://shared/output",
+    )
+
+    script = _render_speculator_training_script(trainer)
+
+    assert "data_path='/mnt/kubeflow-checkpoints/arrow_dataset'" in script
+
+    print("test execution complete")
+
+
+def test_offline_script_auto_derives_data_path():
+    """Test that OFFLINE script auto-derives data_path from output_dir."""
+    print("Executing test: OFFLINE auto-derives data_path")
+
+    trainer = SpeculativeDecodingTrainer(
+        verifier_model="Qwen/Qwen3-8B",
+        mode=SpeculatorMode.OFFLINE,
+        dataset_name="sharegpt",
+        output_dir="pvc://shared/offline_output",
+        vllm_endpoint="http://vllm-svc:8000/v1",
+    )
+
+    script = _render_speculator_training_script(trainer)
+
+    assert "data_path='/mnt/kubeflow-checkpoints/offline_output'" in script
+
+    print("test execution complete")
+
+
+def test_train_only_script_passes_draft_vocab_size():
+    """Test that TRAIN_ONLY script passes draft_vocab_size."""
+    print("Executing test: TRAIN_ONLY passes draft_vocab_size")
+
+    trainer = SpeculativeDecodingTrainer(
+        verifier_model="Qwen/Qwen3-8B",
+        mode=SpeculatorMode.TRAIN_ONLY,
+        hidden_states_path="/data/hidden_states",
+        data_path="/data/arrow_dataset",
+        output_dir="pvc://test-pvc/output",
+        draft_vocab_size=8192,
+    )
+
+    script = _render_speculator_training_script(trainer)
+
+    assert "draft_vocab_size=8192" in script
+
+    print("test execution complete")
+
+
+def test_train_only_script_draft_vocab_size_none_by_default():
+    """Test that draft_vocab_size defaults to None in rendered script."""
+    print("Executing test: draft_vocab_size defaults to None")
+
+    trainer = SpeculativeDecodingTrainer(
+        verifier_model="Qwen/Qwen3-8B",
+        mode=SpeculatorMode.TRAIN_ONLY,
+        hidden_states_path="/data/hidden_states",
+        output_dir="pvc://test-pvc/output",
+    )
+
+    script = _render_speculator_training_script(trainer)
+
+    assert "draft_vocab_size=None" in script
+
+    print("test execution complete")
+
+
+def test_train_only_script_contains_vocab_mapping_logic():
+    """Test that TRAIN_ONLY script contains vocab mapping imports and logic."""
+    print("Executing test: TRAIN_ONLY contains vocab mapping logic")
+
+    trainer = SpeculativeDecodingTrainer(
+        verifier_model="Qwen/Qwen3-8B",
+        mode=SpeculatorMode.TRAIN_ONLY,
+        hidden_states_path="/data/hidden_states",
+        output_dir="pvc://test-pvc/output",
+    )
+
+    script = _render_speculator_training_script(trainer)
+
+    assert "build_vocab_mappings_from_distribution" in script
+    assert "d2t_path = Path(data_path)" in script
+    assert "t2d_path = Path(data_path)" in script
+    assert '"d2t": d2t' in script
+    assert '"t2d": t2d' in script
+
+    print("test execution complete")
