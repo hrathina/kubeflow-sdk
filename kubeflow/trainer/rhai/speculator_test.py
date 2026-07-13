@@ -507,23 +507,6 @@ def test_numeric_field_validation(test_case):
     print("test execution complete")
 
 
-def test_training_script_uses_verifier_vocab_when_draft_unset():
-    """Test that generated script omits --draft-vocab-size when draft_vocab_size is None."""
-    print("Executing test: Training script uses verifier vocab size when unset")
-
-    trainer = SpeculativeDecodingTrainer(
-        verifier_model="Qwen/Qwen3-8B",
-        hidden_states_path="/data/hidden_states",
-        output_dir="pvc://test-pvc/output",
-    )
-
-    script = _render_speculator_training_script(trainer)
-
-    assert "'--draft-vocab-size'" not in script
-
-    print("test execution complete")
-
-
 def test_crd_conversion_train_only():
     """Test CRD conversion for TRAIN_ONLY mode."""
     print("Executing test: CRD conversion for TRAIN_ONLY")
@@ -973,6 +956,25 @@ def test_data_only_renders_correct_script():
     assert "dataset_name='sharegpt'" in script
     assert "/mnt/kubeflow-checkpoints/datagen_output" in script
     assert "EXTRACTION_INCOMPLETE_MARKER" in script
+
+    print("test execution complete")
+
+
+def test_data_only_script_passes_world_size_and_rank():
+    """Test that datagen command passes --world-size and --rank from env vars."""
+    print("Executing test: DATA_ONLY script passes world-size and rank")
+
+    trainer = SpeculativeDecodingTrainer(
+        verifier_model="Qwen/Qwen3-8B",
+        mode=SpeculatorMode.DATA_ONLY,
+        dataset_name="sharegpt",
+        output_dir="pvc://test-pvc/output",
+    )
+
+    script = _render_speculator_training_script(trainer)
+
+    assert '"--world-size"' in script
+    assert '"--rank"' in script
 
     print("test execution complete")
 

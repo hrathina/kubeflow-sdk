@@ -348,6 +348,7 @@ def _speculator_data_only(
     vllm_endpoint: str | None = None,
     concurrency: int = 4,
     gpu_memory_utilization: float = 0.9,
+    vllm_gpu_count: int = 1,
 ) -> None:
     """Data extraction function injected into pods via inspect.getsource().
 
@@ -465,6 +466,8 @@ def _speculator_data_only(
             str(gpu_memory_utilization),
             "--max-model-len",
             str(total_seq_len + 1),
+            "--tensor-parallel-size",
+            str(vllm_gpu_count),
             "--no-enable-chunked-prefill",
         ]
         print(f"vLLM command: {' '.join(vllm_cmd)}", flush=True)
@@ -517,9 +520,12 @@ def _speculator_data_only(
         print(f"Wrote bundled data_generation_offline.py to {script_path}", flush=True)
 
     try:
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
         datagen_cmd = [
             sys.executable,
             script_path,
+            "--model",
+            verifier_model,
             "--preprocessed-data",
             save_path,
             "--endpoint",
@@ -528,6 +534,10 @@ def _speculator_data_only(
             hidden_states_dir,
             "--concurrency",
             str(concurrency),
+            "--world-size",
+            str(world_size),
+            "--rank",
+            str(rank),
         ]
         if max_samples is not None:
             datagen_cmd.extend(["--max-samples", str(max_samples)])
@@ -769,6 +779,7 @@ def _render_speculator_training_script(trainer: SpeculativeDecodingTrainer) -> s
         f"    vllm_endpoint={trainer.vllm_endpoint!r},\n"
         f"    concurrency={cfg.datagen_concurrency!r},\n"
         f"    gpu_memory_utilization={trainer.vllm_gpu_memory_utilization!r},\n"
+        f"    vllm_gpu_count={trainer.vllm_gpu_count!r},\n"
         f")\n"
     )
 
