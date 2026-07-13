@@ -162,6 +162,7 @@ class SpeculativeDecodingTrainer:
     epochs: int = 3
     lr: float = 1e-4
     total_seq_len: int = 8192
+    draft_vocab_size: int | None = None
     training_gpu_count: int = 1
     vllm_gpu_count: int = 1
     vllm_gpu_memory_utilization: float = 0.9
@@ -500,11 +501,13 @@ def _speculator_data_only(
 
 def _speculator_train_only(
     verifier_model: str,
+    data_path: str,
     hidden_states_path: str,
     save_path: str,
     epochs: int,
     lr: float,
     total_seq_len: int,
+    draft_vocab_size: int | None = None,
     hidden_states_dtype: str = "bfloat16",
     num_layers: int = 1,
     ttt_steps: int = 3,
@@ -528,10 +531,12 @@ def _speculator_train_only(
     """
     import contextlib
     import os
+    from pathlib import Path
+
+    import numpy as np
 
     if "_set_phase" in globals():
         _set_phase("initializing", 0)  # noqa: F821
-
     from speculators.models.eagle3.core import Eagle3DraftModel
     from speculators.models.eagle3.data import shift_batch
     from speculators.train.data import ArrowDataset, create_collate_fn
@@ -540,6 +545,7 @@ def _speculator_train_only(
     )
     from speculators.train.noise_transforms import AddUniformNoise
     from speculators.train.trainer import Trainer, TrainerConfig
+    from speculators.train.vocab_mapping import build_vocab_mappings_from_distribution
     import torch
     from torch.utils.data import DataLoader
     from transformers import AutoConfig
@@ -562,15 +568,37 @@ def _speculator_train_only(
         torch.cuda.set_device(local_rank)
 
     verifier_config = AutoConfig.from_pretrained(verifier_model)
+    target_vocab_size = verifier_config.vocab_size
+
+    d2t_path = Path(data_path) / "d2t.npy"
+    t2d_path = Path(data_path) / "t2d.npy"
+
+    if d2t_path.exists() and t2d_path.exists():
+        d2t = torch.from_numpy(np.load(str(d2t_path)))
+        t2d = torch.from_numpy(np.load(str(t2d_path)))
+        resolved_draft_vocab = len(d2t)
+    else:
+        resolved_draft_vocab = draft_vocab_size or min(8192, target_vocab_size)
+        token_freq_path = Path(data_path) / "token_freq.pt"
+        token_freq_dict = torch.load(str(token_freq_path), weights_only=True)
+        d2t, t2d = build_vocab_mappings_from_distribution(
+            token_freq_dict=token_freq_dict,
+            draft_vocab_size=resolved_draft_vocab,
+            target_vocab_size=target_vocab_size,
+        )
+        np.save(str(d2t_path), d2t.cpu().numpy())
+        np.save(str(t2d_path), t2d.cpu().numpy())
 
     from_training_kwargs = {
-        "draft_vocab_size": verifier_config.vocab_size,
+        "draft_vocab_size": resolved_draft_vocab,
         "num_layers": num_layers,
         "norm_before_residual": norm_before_residual,
         "norm_before_fc": norm_before_fc,
         "embed_requires_grad": embed_requires_grad,
         "ttt_steps": ttt_steps,
         "verifier_name_or_path": verifier_model,
+        "d2t": d2t,
+        "t2d": t2d,
     }
     if from_pretrained is not None:
         from_training_kwargs["from_pretrained"] = from_pretrained
@@ -582,7 +610,8 @@ def _speculator_train_only(
 
     train_dataset = ArrowDataset(
         max_len=max_len,
-        datapath=hidden_states_path,
+        datapath=data_path,
+        hidden_states_path=hs_dir,
         split_ratio=0.9,
         on_missing="skip",
         transform=AddUniformNoise(),
@@ -590,7 +619,8 @@ def _speculator_train_only(
     )
     val_dataset = ArrowDataset(
         max_len=max_len,
-        datapath=hidden_states_path,
+        datapath=data_path,
+        hidden_states_path=hs_dir,
         split_ratio=-0.1,
         on_missing="skip",
         hidden_states_dtype=hs_dtype,
@@ -711,6 +741,14 @@ def _render_speculator_training_script(trainer: SpeculativeDecodingTrainer) -> s
     else:
         resolved_hidden_states = resolved_output_dir
 
+    if trainer.mode == SpeculatorMode.TRAIN_ONLY:
+        if trainer.data_path and trainer.data_path.startswith(PVC_URI_SCHEME):
+            resolved_data_path, _ = parse_output_dir_uri(trainer.data_path)
+        else:
+            resolved_data_path = trainer.data_path
+    else:
+        resolved_data_path = resolved_output_dir
+
     if trainer.mode == SpeculatorMode.DATA_ONLY:
         from kubeflow.trainer.rhai.constants import VLLM_SIDECAR_ENDPOINT
 
@@ -733,11 +771,13 @@ def _render_speculator_training_script(trainer: SpeculativeDecodingTrainer) -> s
     train_call = (
         f"_speculator_train_only(\n"
         f"    verifier_model={resolved_verifier_model!r},\n"
+        f"    data_path={resolved_data_path!r},\n"
         f"    hidden_states_path={resolved_hidden_states!r},\n"
         f"    save_path={resolved_output_dir!r},\n"
         f"    epochs={trainer.epochs!r},\n"
         f"    lr={trainer.lr!r},\n"
         f"    total_seq_len={trainer.total_seq_len!r},\n"
+        f"    draft_vocab_size={trainer.draft_vocab_size!r},\n"
         f"    hidden_states_dtype={cfg.hidden_states_dtype!r},\n"
         f"    num_layers={cfg.num_layers!r},\n"
         f"    ttt_steps={cfg.ttt_steps!r},\n"
