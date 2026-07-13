@@ -78,17 +78,22 @@ class SpeculatorConfig:
         hidden_states_dtype: PyTorch dtype for hidden states tensors (default: "bfloat16").
             Must match the verifier model's dtype. Supported: "bfloat16", "float16", "float32".
         scheduler_type: Learning rate scheduler type (default: "linear").
-        loss_fn: Loss function (default: "kl_div").
-        noise_std: Noise standard deviation for data augmentation (default: 0.05).
+            Supported: "linear", "cosine", "none".
+        scheduler_warmup_steps: Number of warmup steps for the learning rate scheduler.
+            When ``None`` (default), computed as 1% of total training steps.
+        scheduler_total_steps: Total number of steps for the learning rate scheduler.
+            When ``None`` (default), computed as ``num_epochs * steps_per_epoch``.
+        scheduler_num_cosine_cycles: Number of cosine cycles for the cosine scheduler
+            (default: 0.5). Only used when ``scheduler_type="cosine"``.
         checkpoint_freq: Checkpoint frequency in epochs (default: 1.0).
+        save_best: Save only the best model checkpoint by validation loss (default: False).
         log_freq: Logging frequency in steps (default: 1).
+        resume_from_checkpoint: Resume training from an existing checkpoint (default: False).
         datagen_concurrency: Number of concurrent requests to vLLM for hidden state
             extraction (default: 4).
         target_layer_ids: Specific layer IDs for hidden state extraction. When ``None``,
             auto-selected from the verifier model architecture.
         from_pretrained: Path to a pretrained draft model to resume training from.
-        use_off_policy_tokens: Use off-policy tokens during training (default: False).
-        ttt_step_loss_decay: Loss decay factor for TTT steps (default: 1.0).
     """
 
     num_layers: int = 1
@@ -98,15 +103,16 @@ class SpeculatorConfig:
     embed_requires_grad: bool = False
     hidden_states_dtype: str = "bfloat16"
     scheduler_type: str = "linear"
-    loss_fn: str = "kl_div"
-    noise_std: float = 0.05
+    scheduler_warmup_steps: int | None = None
+    scheduler_total_steps: int | None = None
+    scheduler_num_cosine_cycles: float = 0.5
     checkpoint_freq: float = 1.0
+    save_best: bool = False
     log_freq: int = 1
+    resume_from_checkpoint: bool = False
     datagen_concurrency: int = 4
     target_layer_ids: list[int] | None = None
     from_pretrained: str | None = None
-    use_off_policy_tokens: bool = False
-    ttt_step_loss_decay: float = 1.0
 
 
 @dataclass
@@ -258,12 +264,11 @@ class SpeculativeDecodingTrainer:
                 f"got {self.vllm_gpu_memory_utilization!r}."
             )
 
-        if self.config is not None:
-            if self.config.hidden_states_dtype not in _SUPPORTED_DTYPES:
-                raise ValueError(
-                    f"config.hidden_states_dtype must be one of {_SUPPORTED_DTYPES}, "
-                    f"got '{self.config.hidden_states_dtype}'."
-                )
+        if self.config is not None and self.config.hidden_states_dtype not in _SUPPORTED_DTYPES:
+            raise ValueError(
+                f"config.hidden_states_dtype must be one of {_SUPPORTED_DTYPES}, "
+                f"got '{self.config.hidden_states_dtype}'."
+            )
 
         if not isinstance(self.metrics_port, int):
             raise ValueError(
@@ -355,7 +360,6 @@ def _speculator_data_only(
     """
     import json
     import os
-    import shutil
     import subprocess
     import sys
     import time
@@ -389,9 +393,7 @@ def _speculator_data_only(
 
     try:
         with open(incomplete_marker, "w") as f:
-            f.write(
-                f"Data extraction in progress (rank {rank})"
-            )
+            f.write(f"Data extraction in progress (rank {rank})")
     except Exception as e:
         print(
             f"Warning: Failed to write sentinel file: {e}. "
@@ -572,13 +574,14 @@ def _speculator_train_only(
     norm_before_fc: bool = False,
     embed_requires_grad: bool = False,
     scheduler_type: str = "linear",
-    loss_fn: str = "kl_div",
-    noise_std: float = 0.05,
+    scheduler_warmup_steps: int | None = None,
+    scheduler_total_steps: int | None = None,
+    scheduler_num_cosine_cycles: float = 0.5,
     checkpoint_freq: float = 1.0,
+    save_best: bool = False,
     log_freq: int = 1,
+    resume_from_checkpoint: bool = False,
     from_pretrained: str | None = None,
-    use_off_policy_tokens: bool = False,
-    ttt_step_loss_decay: float = 1.0,
 ) -> None:
     """Training function injected into pods via inspect.getsource().
 
@@ -675,9 +678,7 @@ def _speculator_train_only(
         num_workers=2,
         prefetch_factor=4,
     )
-    val_loader = DataLoader(
-        val_dataset, batch_sampler=val_batch_sampler, collate_fn=collate_fn
-    )
+    val_loader = DataLoader(val_dataset, batch_sampler=val_batch_sampler, collate_fn=collate_fn)
 
     with contextlib.suppress(NameError):
         _set_steps_per_epoch(len(train_loader))  # noqa: F821
@@ -686,17 +687,19 @@ def _speculator_train_only(
         lr=lr,
         num_epochs=epochs,
         save_path=save_path,
-        scheduler_type=scheduler_type,
-        loss_fn=loss_fn,
-        noise_std=noise_std,
-        checkpoint_freq=checkpoint_freq,
-        log_freq=log_freq,
-        use_off_policy_tokens=use_off_policy_tokens,
-        ttt_step_loss_decay=ttt_step_loss_decay,
+        resume_from_checkpoint=resume_from_checkpoint,
         is_distributed=is_distributed,
         local_rank=local_rank,
         train_call_kwargs={"shift_fn": shift_batch},
         val_call_kwargs={"shift_fn": shift_batch},
+        scheduler_type=scheduler_type,
+        scheduler_warmup_steps=scheduler_warmup_steps,
+        scheduler_total_steps=scheduler_total_steps,
+        scheduler_num_cosine_cycles=scheduler_num_cosine_cycles,
+        checkpoint_freq=checkpoint_freq,
+        save_best=save_best,
+        hidden_states_dtype=hs_dtype,
+        log_freq=log_freq,
     )
 
     trainer = Trainer(model, config, train_loader, val_loader)
@@ -784,13 +787,14 @@ def _render_speculator_training_script(trainer: SpeculativeDecodingTrainer) -> s
         f"    norm_before_fc={cfg.norm_before_fc!r},\n"
         f"    embed_requires_grad={cfg.embed_requires_grad!r},\n"
         f"    scheduler_type={cfg.scheduler_type!r},\n"
-        f"    loss_fn={cfg.loss_fn!r},\n"
-        f"    noise_std={cfg.noise_std!r},\n"
+        f"    scheduler_warmup_steps={cfg.scheduler_warmup_steps!r},\n"
+        f"    scheduler_total_steps={cfg.scheduler_total_steps!r},\n"
+        f"    scheduler_num_cosine_cycles={cfg.scheduler_num_cosine_cycles!r},\n"
         f"    checkpoint_freq={cfg.checkpoint_freq!r},\n"
+        f"    save_best={cfg.save_best!r},\n"
         f"    log_freq={cfg.log_freq!r},\n"
+        f"    resume_from_checkpoint={cfg.resume_from_checkpoint!r},\n"
         f"    from_pretrained={cfg.from_pretrained!r},\n"
-        f"    use_off_policy_tokens={cfg.use_off_policy_tokens!r},\n"
-        f"    ttt_step_loss_decay={cfg.ttt_step_loss_decay!r},\n"
         f")\n"
     )
 

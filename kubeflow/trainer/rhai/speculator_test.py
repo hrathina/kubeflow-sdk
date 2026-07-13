@@ -303,6 +303,64 @@ def test_training_script_content():
     print("test execution complete")
 
 
+def test_training_script_trainer_config_fields():
+    """Test that generated script passes all TrainerConfig fields from SpeculatorConfig."""
+    print("Executing test: Training script TrainerConfig fields")
+
+    trainer = SpeculativeDecodingTrainer(
+        verifier_model="Qwen/Qwen3-8B",
+        hidden_states_path="/data/hidden_states",
+        output_dir="pvc://test-pvc/output",
+        config=SpeculatorConfig(
+            scheduler_type="cosine",
+            scheduler_warmup_steps=100,
+            scheduler_total_steps=5000,
+            scheduler_num_cosine_cycles=1.0,
+            checkpoint_freq=0.5,
+            save_best=True,
+            log_freq=10,
+            resume_from_checkpoint=True,
+        ),
+    )
+
+    script = _render_speculator_training_script(trainer)
+
+    assert "scheduler_type='cosine'" in script
+    assert "scheduler_warmup_steps=100" in script
+    assert "scheduler_total_steps=5000" in script
+    assert "scheduler_num_cosine_cycles=1.0" in script
+    assert "checkpoint_freq=0.5" in script
+    assert "save_best=True" in script
+    assert "log_freq=10" in script
+    assert "resume_from_checkpoint=True" in script
+
+    print("test execution complete")
+
+
+def test_training_script_trainer_config_defaults():
+    """Test that default SpeculatorConfig passes correct defaults for TrainerConfig fields."""
+    print("Executing test: Training script TrainerConfig defaults")
+
+    trainer = SpeculativeDecodingTrainer(
+        verifier_model="Qwen/Qwen3-8B",
+        hidden_states_path="/data/hidden_states",
+        output_dir="pvc://test-pvc/output",
+    )
+
+    script = _render_speculator_training_script(trainer)
+
+    assert "scheduler_type='linear'" in script
+    assert "scheduler_warmup_steps=None" in script
+    assert "scheduler_total_steps=None" in script
+    assert "scheduler_num_cosine_cycles=0.5" in script
+    assert "checkpoint_freq=1.0" in script
+    assert "save_best=False" in script
+    assert "log_freq=1" in script
+    assert "resume_from_checkpoint=False" in script
+
+    print("test execution complete")
+
+
 def test_training_script_with_pvc_output_dir():
     """Test that output_dir PVC URI resolves to correct save_path in training script."""
     print("Executing test: Training script with PVC output_dir")
@@ -1352,7 +1410,7 @@ def test_data_only_progression_tracking_injected():
 
 
 def test_data_only_script_contains_marker_logic():
-    """Test that DATA_ONLY script contains incomplete marker check and cleanup."""
+    """Test that DATA_ONLY script contains per-rank incomplete marker check and cleanup."""
     print("Executing test: DATA_ONLY script contains marker logic")
 
     trainer = SpeculativeDecodingTrainer(
@@ -1366,7 +1424,6 @@ def test_data_only_script_contains_marker_logic():
 
     assert "EXTRACTION_INCOMPLETE_MARKER" in script
     assert "Incomplete data extraction detected" in script
-    assert "shutil.rmtree" in script
     assert "os.remove(incomplete_marker)" in script
 
     print("test execution complete")
