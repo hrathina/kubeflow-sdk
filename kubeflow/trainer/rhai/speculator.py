@@ -1265,31 +1265,23 @@ def apply_speculator_sidecar_overrides(
         resolved_verifier = trainer.verifier_model
 
     cfg = trainer.config or SpeculatorConfig()
+
+    sidecar_env = [
+        {"name": "SPECULATOR_VERIFIER_MODEL", "value": resolved_verifier},
+        {"name": "SPECULATOR_HS_PATH", "value": hs_path},
+        {
+            "name": "SPECULATOR_GPU_MEM_UTIL",
+            "value": str(trainer.vllm_gpu_memory_utilization),
+        },
+        {"name": "SPECULATOR_VLLM_GPU_COUNT", "value": str(trainer.vllm_gpu_count)},
+    ]
     if cfg.target_layer_ids is not None:
-        layer_ids = cfg.target_layer_ids
-    else:
-        from transformers import AutoConfig
-
-        model_config = AutoConfig.from_pretrained(resolved_verifier, trust_remote_code=True)
-        if hasattr(model_config, "text_config"):
-            model_config = model_config.text_config
-        n = model_config.num_hidden_layers
-        layer_ids = [2, n // 2, n - 3]
-
-    layer_ids_str = ",".join(str(lid) for lid in layer_ids)
+        layer_ids_str = ",".join(str(lid) for lid in cfg.target_layer_ids)
+        sidecar_env.append({"name": "SPECULATOR_TARGET_LAYER_IDS", "value": layer_ids_str})
 
     sidecar_override = {
         "name": VLLM_SIDECAR_CONTAINER_NAME,
-        "env": [
-            {"name": "SPECULATOR_VERIFIER_MODEL", "value": resolved_verifier},
-            {"name": "SPECULATOR_HS_PATH", "value": hs_path},
-            {
-                "name": "SPECULATOR_GPU_MEM_UTIL",
-                "value": str(trainer.vllm_gpu_memory_utilization),
-            },
-            {"name": "SPECULATOR_VLLM_GPU_COUNT", "value": str(trainer.vllm_gpu_count)},
-            {"name": "SPECULATOR_TARGET_LAYER_IDS", "value": layer_ids_str},
-        ],
+        "env": sidecar_env,
         "volumeMounts": [
             {
                 "name": CHECKPOINT_VOLUME_NAME,
