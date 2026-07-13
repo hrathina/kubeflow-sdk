@@ -1,0 +1,1262 @@
+# Copyright 2025 The Kubeflow Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""SpeculativeDecodingTrainer for custom draft model training via the speculators library.
+
+This module provides the SpeculativeDecodingTrainer and SpeculatorConfig dataclasses
+for training speculative decoding draft models (e.g., Eagle3) using the speculators
+library. Supports TRAIN_ONLY, DATA_ONLY, OFFLINE, and ONLINE modes.
+"""
+
+from dataclasses import dataclass, field
+from enum import Enum
+
+from kubeflow_trainer_api import models
+
+import kubeflow.trainer.backends.kubernetes.utils as k8s_utils
+from kubeflow.trainer.constants import constants
+from kubeflow.trainer.rhai.constants import PVC_URI_SCHEME
+from kubeflow.trainer.types import types
+
+
+class SpeculatorMode(Enum):
+    """Training mode for speculator training.
+
+    Args:
+        TRAIN_ONLY: Train draft model from pre-extracted hidden states on PVC.
+        DATA_ONLY: Extract hidden states from verifier model via vLLM (future).
+        OFFLINE: Extract hidden states via user-managed vLLM endpoint, then train.
+        ONLINE: Online training with a custom runtime image that includes all dependencies.
+    """
+
+    TRAIN_ONLY = "train_only"
+    DATA_ONLY = "data_only"
+    OFFLINE = "offline"
+    ONLINE = "online"
+
+
+class SpeculatorType(Enum):
+    """Draft model architecture for speculative decoding.
+
+    Args:
+        EAGLE3: Eagle3 draft model architecture.
+        DFLASH: DFlash draft model architecture.
+        MTP: Multi-Token Prediction draft model architecture.
+        PEAGLE: PEAGLE draft model architecture.
+    """
+
+    EAGLE3 = "eagle3"
+    DFLASH = "dflash"
+    MTP = "mtp"
+    PEAGLE = "peagle"
+
+
+_SUPPORTED_DTYPES = {"bfloat16", "float16", "float32"}
+
+
+@dataclass
+class SpeculatorConfig:
+    """Advanced configuration for speculator training.
+
+    Args:
+        num_layers: Number of draft model layers (default: 1).
+        ttt_steps: Test-time training steps (default: 3).
+        norm_before_residual: Apply normalization before residual connection (default: True).
+        norm_before_fc: Apply normalization before fully-connected layer (default: False).
+        embed_requires_grad: Whether embedding layer requires gradients (default: False).
+        hidden_states_dtype: PyTorch dtype for hidden states tensors (default: "bfloat16").
+            Must match the verifier model's dtype. Supported: "bfloat16", "float16", "float32".
+        scheduler_type: Learning rate scheduler type (default: "linear").
+        loss_fn: Loss function (default: "kl_div").
+        noise_std: Noise standard deviation for data augmentation (default: 0.05).
+        checkpoint_freq: Checkpoint frequency in epochs (default: 1.0).
+        log_freq: Logging frequency in steps (default: 1).
+        datagen_concurrency: Number of concurrent requests to vLLM for hidden state
+            extraction (default: 4).
+        target_layer_ids: Specific layer IDs for hidden state extraction. When ``None``,
+            auto-selected from the verifier model architecture.
+        from_pretrained: Path to a pretrained draft model to resume training from.
+        use_off_policy_tokens: Use off-policy tokens during training (default: False).
+        ttt_step_loss_decay: Loss decay factor for TTT steps (default: 1.0).
+    """
+
+    num_layers: int = 1
+    ttt_steps: int = 3
+    norm_before_residual: bool = True
+    norm_before_fc: bool = False
+    embed_requires_grad: bool = False
+    hidden_states_dtype: str = "bfloat16"
+    scheduler_type: str = "linear"
+    loss_fn: str = "kl_div"
+    noise_std: float = 0.05
+    checkpoint_freq: float = 1.0
+    log_freq: int = 1
+    datagen_concurrency: int = 4
+    target_layer_ids: list[int] | None = None
+    from_pretrained: str | None = None
+    use_off_policy_tokens: bool = False
+    ttt_step_loss_decay: float = 1.0
+
+
+@dataclass
+class SpeculativeDecodingTrainer:
+    """RHAI trainer for custom draft model training via the speculators library.
+
+    Args:
+        verifier_model: HuggingFace model ID or path to the verifier model.
+        speculator_type: Draft model architecture (default: EAGLE3).
+        mode: Training mode (default: TRAIN_ONLY).
+        hidden_states_path: Pre-extracted hidden states on PVC (required for TRAIN_ONLY).
+        data_path: Path to preprocessed Arrow dataset (optional for TRAIN_ONLY).
+        dataset_name: Dataset for hidden state extraction (required for DATA_ONLY/OFFLINE).
+            Built-in names (``"sharegpt"``, ``"ultrachat"``, ``"gsm8k"``), a HuggingFace
+            dataset ID, or a local ``.json``/``.jsonl`` file path.
+        max_samples: Maximum number of dataset samples to use for data generation.
+            Useful for quick testing. When ``None`` (default), all samples are used.
+        epochs: Training epochs (default: 3).
+        lr: Learning rate (default: 1e-4).
+        total_seq_len: Maximum sequence length for dataset preprocessing,
+            vLLM context window, and training (default: 8192).
+        training_gpu_count: Number of GPUs for training (default: 1).
+        vllm_gpu_count: Number of GPUs for vLLM sidecar (default: 1).
+        vllm_gpu_memory_utilization: Fraction of GPU memory for vLLM (default: 0.9).
+        config: Advanced training configuration. See ``SpeculatorConfig``.
+        num_nodes: Number of nodes for distributed training.
+        packages_to_install: Python packages to install before training.
+        pip_index_urls: PyPI index URLs for package installation.
+        env: Environment variables to set in training pods.
+        output_dir: Directory for saving outputs. Supports PVC URIs
+            (pvc://<name>/<path>). The SDK auto-mounts the volume and resolves the path.
+        vllm_endpoint: URL of user-managed vLLM endpoint for hidden state
+            extraction. Used in OFFLINE and DATA_ONLY modes. When ``None``, a managed
+            vLLM server is launched automatically.
+        enable_progression_tracking: Enable progression tracking (default: True).
+        metrics_port: HTTP server port for metrics endpoint (default: 28080).
+        metrics_poll_interval_seconds: How often controller polls metrics (default: 30).
+    """
+
+    verifier_model: str
+    speculator_type: SpeculatorType = SpeculatorType.EAGLE3
+    mode: SpeculatorMode = SpeculatorMode.TRAIN_ONLY
+    hidden_states_path: str | None = None
+    data_path: str | None = None
+    dataset_name: str | None = None
+    max_samples: int | None = None
+    epochs: int = 3
+    lr: float = 1e-4
+    total_seq_len: int = 8192
+    training_gpu_count: int = 1
+    vllm_gpu_count: int = 1
+    vllm_gpu_memory_utilization: float = 0.9
+    config: SpeculatorConfig | None = None
+    num_nodes: int | None = None
+    packages_to_install: list[str] | None = None
+    pip_index_urls: list[str] = field(
+        default_factory=lambda: list(constants.DEFAULT_PIP_INDEX_URLS)
+    )
+    env: dict[str, str] | None = None
+    output_dir: str | None = None
+    vllm_endpoint: str | None = None
+
+    enable_progression_tracking: bool = True
+    metrics_port: int = 28080
+    metrics_poll_interval_seconds: int = 30
+
+    def __post_init__(self) -> None:
+        """Validate configuration after initialization."""
+        supported_modes = {
+            SpeculatorMode.TRAIN_ONLY,
+            SpeculatorMode.DATA_ONLY,
+            SpeculatorMode.OFFLINE,
+        }
+        if self.mode not in supported_modes:
+            raise NotImplementedError(
+                f"Mode '{self.mode.value}' is not yet supported. "
+                f"Currently supported modes: {', '.join(m.value for m in supported_modes)}."
+            )
+
+        if self.speculator_type != SpeculatorType.EAGLE3:
+            raise NotImplementedError(
+                f"Speculator type '{self.speculator_type.value}' is not yet supported. "
+                f"Currently only '{SpeculatorType.EAGLE3.value}' is supported."
+            )
+
+        if self.mode == SpeculatorMode.TRAIN_ONLY and not self.hidden_states_path:
+            raise ValueError(
+                "hidden_states_path is required for TRAIN_ONLY mode. "
+                "Provide the path to pre-extracted hidden states on PVC."
+            )
+
+        if not self.output_dir:
+            raise ValueError(
+                f"output_dir is required for {self.mode.name} mode. "
+                "Provide a PVC URI (pvc://<name>/<path>)."
+            )
+
+        if (
+            self.mode in (SpeculatorMode.DATA_ONLY, SpeculatorMode.OFFLINE)
+            and not self.dataset_name
+        ):
+            raise ValueError(
+                f"dataset_name is required for {self.mode.name} mode. "
+                "Provide a HuggingFace dataset ID or name (e.g. 'sharegpt')."
+            )
+
+        if self.vllm_endpoint is not None and self.mode not in (
+            SpeculatorMode.DATA_ONLY,
+            SpeculatorMode.OFFLINE,
+        ):
+            raise ValueError("vllm_endpoint is only supported in DATA_ONLY and OFFLINE modes.")
+
+        if self.max_samples is not None:
+            if self.mode not in (SpeculatorMode.DATA_ONLY, SpeculatorMode.OFFLINE):
+                raise ValueError("max_samples is only supported in DATA_ONLY and OFFLINE modes.")
+            if not isinstance(self.max_samples, int) or self.max_samples < 1:
+                raise ValueError(
+                    f"max_samples must be a positive integer, got {self.max_samples!r}."
+                )
+
+        if not isinstance(self.epochs, int) or self.epochs < 1:
+            raise ValueError(f"epochs must be a positive integer, got {self.epochs!r}.")
+
+        if not isinstance(self.lr, (int, float)) or self.lr <= 0:
+            raise ValueError(f"lr must be a positive number, got {self.lr!r}.")
+
+        if not isinstance(self.total_seq_len, int) or self.total_seq_len < 1:
+            raise ValueError(
+                f"total_seq_len must be a positive integer, got {self.total_seq_len!r}."
+            )
+
+        if not isinstance(self.training_gpu_count, int) or self.training_gpu_count < 1:
+            raise ValueError(
+                f"training_gpu_count must be a positive integer, got {self.training_gpu_count!r}."
+            )
+
+        if not isinstance(self.vllm_gpu_count, int) or self.vllm_gpu_count < 1:
+            raise ValueError(
+                f"vllm_gpu_count must be a positive integer, got {self.vllm_gpu_count!r}."
+            )
+
+        if (
+            not isinstance(self.vllm_gpu_memory_utilization, (int, float))
+            or self.vllm_gpu_memory_utilization <= 0
+            or self.vllm_gpu_memory_utilization > 1.0
+        ):
+            raise ValueError(
+                f"vllm_gpu_memory_utilization must be in range (0, 1.0], "
+                f"got {self.vllm_gpu_memory_utilization!r}."
+            )
+
+        if self.config is not None:
+            if self.config.hidden_states_dtype not in _SUPPORTED_DTYPES:
+                raise ValueError(
+                    f"config.hidden_states_dtype must be one of {_SUPPORTED_DTYPES}, "
+                    f"got '{self.config.hidden_states_dtype}'."
+                )
+
+        if not isinstance(self.metrics_port, int):
+            raise ValueError(
+                f"metrics_port must be an integer, got {type(self.metrics_port).__name__}"
+            )
+        if self.metrics_port < 1024 or self.metrics_port > 65535:
+            raise ValueError(f"metrics_port must be in range 1024-65535, got {self.metrics_port}")
+
+        if not isinstance(self.metrics_poll_interval_seconds, int):
+            raise ValueError(
+                f"metrics_poll_interval_seconds must be an integer, "
+                f"got {type(self.metrics_poll_interval_seconds).__name__}"
+            )
+        if self.metrics_poll_interval_seconds < 5 or self.metrics_poll_interval_seconds > 300:
+            raise ValueError(
+                f"metrics_poll_interval_seconds must be in range 5-300 seconds, "
+                f"got {self.metrics_poll_interval_seconds}"
+            )
+
+        if self.output_dir:
+            from kubeflow.trainer.rhai.utils import normalize_and_validate_output_dir
+
+            self.output_dir = normalize_and_validate_output_dir(self.output_dir)
+
+        if (
+            self.output_dir
+            and "://" in self.output_dir
+            and not self.output_dir.startswith(PVC_URI_SCHEME)
+        ):
+            raise NotImplementedError(
+                f"output_dir scheme '{self.output_dir.split('://')[0]}://' is not yet supported "
+                f"for SpeculativeDecodingTrainer. Currently only PVC URIs (pvc://<name>/<path>) "
+                f"or direct paths are supported."
+            )
+
+        if self.hidden_states_path:
+            from kubeflow.trainer.rhai.utils import normalize_and_validate_output_dir
+
+            self.hidden_states_path = normalize_and_validate_output_dir(self.hidden_states_path)
+
+        if (
+            self.hidden_states_path
+            and "://" in self.hidden_states_path
+            and not self.hidden_states_path.startswith(PVC_URI_SCHEME)
+        ):
+            raise NotImplementedError(
+                f"hidden_states_path scheme "
+                f"'{self.hidden_states_path.split('://')[0]}://' is not yet supported "
+                f"for SpeculativeDecodingTrainer. Currently only PVC URIs (pvc://<name>/<path>) "
+                f"or direct paths are supported."
+            )
+
+        if self.dataset_name and self.dataset_name.startswith(PVC_URI_SCHEME):
+            from kubeflow.trainer.rhai.utils import normalize_and_validate_output_dir
+
+            self.dataset_name = normalize_and_validate_output_dir(self.dataset_name)
+
+        if (
+            self.dataset_name
+            and "://" in self.dataset_name
+            and not self.dataset_name.startswith(PVC_URI_SCHEME)
+        ):
+            raise NotImplementedError(
+                f"dataset_name scheme "
+                f"'{self.dataset_name.split('://')[0]}://' is not yet supported "
+                f"for SpeculativeDecodingTrainer. Currently only PVC URIs (pvc://<name>/<path>), "
+                f"direct paths, or HuggingFace dataset names are supported."
+            )
+
+
+def _speculator_data_only(
+    verifier_model: str,
+    dataset_name: str,
+    save_path: str,
+    total_seq_len: int,
+    max_samples: int | None = None,
+    vllm_endpoint: str | None = None,
+    concurrency: int = 4,
+    gpu_memory_utilization: float = 0.9,
+) -> None:
+    """Data extraction function injected into pods via inspect.getsource().
+
+    Extracts hidden states from the verifier model via vLLM. When vllm_endpoint
+    is None, a managed vLLM server is launched and stopped automatically.
+    When provided, the user's existing vLLM endpoint is used directly.
+
+    This function is NOT called directly in the SDK. It is extracted as source
+    code and injected into the script that runs inside the container.
+    """
+    import json
+    import os
+    import shutil
+    import subprocess
+    import sys
+    import time
+    import urllib.error
+    import urllib.request
+
+    from speculators.data_generation.preprocessing import load_and_preprocess_dataset
+    from transformers import AutoConfig
+
+    port = 8234
+
+    hidden_states_dir = os.path.join(save_path, "hidden_states")
+    os.makedirs(save_path, exist_ok=True)
+    os.makedirs(hidden_states_dir, exist_ok=True)
+
+    rank = int(os.environ.get("RANK", "0"))
+    marker_name = f"{EXTRACTION_INCOMPLETE_MARKER}.rank-{rank}"  # noqa: F821
+    incomplete_marker = os.path.join(hidden_states_dir, marker_name)
+
+    if os.path.exists(incomplete_marker):
+        print(
+            f"[Kubeflow] Warning: Incomplete data extraction detected for rank {rank}. "
+            "Re-extracting.",
+            flush=True,
+        )
+    elif any(f.endswith(".safetensors") for f in os.listdir(hidden_states_dir)):
+        print("[Kubeflow] Data extraction already completed. Skipping.", flush=True)
+        if "_mark_data_complete" in globals():
+            _mark_data_complete()  # noqa: F821
+        return
+
+    try:
+        with open(incomplete_marker, "w") as f:
+            f.write(
+                f"Data extraction in progress (rank {rank})"
+            )
+    except Exception as e:
+        print(
+            f"Warning: Failed to write sentinel file: {e}. "
+            "Check local disk space and write permissions in output_dir.",
+            flush=True,
+        )
+
+    print("=" * 60, flush=True)
+    print("Stage 1: Preprocessing dataset", flush=True)
+    print("=" * 60, flush=True)
+
+    token_freq_path = os.path.join(save_path, "token_freq.pt")
+    preprocess_kwargs = {
+        "target_model_path": verifier_model,
+        "train_data_paths": [dataset_name],
+        "seq_length": total_seq_len,
+        "token_freq_path": token_freq_path,
+    }
+    if max_samples is not None:
+        preprocess_kwargs["max_samples"] = max_samples
+    dataset, processor = load_and_preprocess_dataset(**preprocess_kwargs)
+    dataset.save_to_disk(save_path)
+    print(f"Saved preprocessed dataset to {save_path} ({len(dataset)} samples)", flush=True)
+
+    if "_start_data_progress_server" in globals():
+        _start_data_progress_server(hidden_states_dir, len(dataset))  # noqa: F821
+
+    vllm_proc = None
+    if vllm_endpoint is None:
+        print("=" * 60, flush=True)
+        print("Stage 2: Launching vLLM server", flush=True)
+        print("=" * 60, flush=True)
+
+        config = AutoConfig.from_pretrained(verifier_model)
+        if hasattr(config, "text_config"):
+            config = config.text_config
+        num_layers = config.num_hidden_layers
+        target_layer_ids = [2, num_layers // 2, num_layers - 3]
+        extraction_layer_ids = list(target_layer_ids)
+        if num_layers not in extraction_layer_ids:
+            extraction_layer_ids.append(num_layers)
+
+        speculative_config = {
+            "method": "extract_hidden_states",
+            "num_speculative_tokens": 1,
+            "draft_model_config": {
+                "hf_config": {"eagle_aux_hidden_state_layer_ids": extraction_layer_ids}
+            },
+        }
+        kv_transfer_config = {
+            "kv_connector": "ExampleHiddenStatesConnector",
+            "kv_role": "kv_producer",
+            "kv_connector_extra_config": {"shared_storage_path": hidden_states_dir},
+        }
+
+        vllm_cmd = [
+            sys.executable,
+            "-m",
+            "vllm.entrypoints.cli.main",
+            "serve",
+            verifier_model,
+            "--speculative_config",
+            json.dumps(speculative_config),
+            "--kv_transfer_config",
+            json.dumps(kv_transfer_config),
+            "--port",
+            str(port),
+            "--gpu-memory-utilization",
+            str(gpu_memory_utilization),
+            "--max-model-len",
+            str(total_seq_len + 1),
+            "--no-enable-chunked-prefill",
+        ]
+        print(f"vLLM command: {' '.join(vllm_cmd)}", flush=True)
+        vllm_proc = subprocess.Popen(vllm_cmd, stdout=sys.stdout, stderr=sys.stderr)
+
+        endpoint = f"http://localhost:{port}/v1"
+        health_url = f"http://localhost:{port}/health"
+        timeout_secs = 600
+        start = time.time()
+        print(f"Waiting for vLLM server (timeout={timeout_secs}s)...", flush=True)
+        while time.time() - start < timeout_secs:
+            if vllm_proc.poll() is not None:
+                raise RuntimeError(f"vLLM process died with exit code {vllm_proc.returncode}")
+            try:
+                req = urllib.request.Request(health_url)
+                resp = urllib.request.urlopen(req, timeout=5)
+                if resp.status == 200:
+                    print(f"vLLM server ready at {endpoint}", flush=True)
+                    break
+            except (urllib.error.URLError, OSError):
+                time.sleep(5)
+        else:
+            vllm_proc.kill()
+            raise RuntimeError(f"vLLM server did not start within {timeout_secs}s")
+    else:
+        endpoint = vllm_endpoint
+        print(f"Using external vLLM endpoint: {endpoint}", flush=True)
+        health = vllm_endpoint.rstrip("/").rsplit("/v1", 1)[0] + "/health"
+        for _i in range(3):
+            try:
+                urllib.request.urlopen(health, timeout=2)
+                print("vLLM ready", flush=True)
+                break
+            except Exception:
+                time.sleep(5)
+        else:
+            sys.exit("vLLM endpoint not reachable")
+
+    print("=" * 60, flush=True)
+    print("Stage 3: Generating hidden states", flush=True)
+    print("=" * 60, flush=True)
+
+    script_path = "/tmp/data_generation_offline.py"
+    if not os.path.exists(script_path):
+        import base64
+
+        script_content = base64.b64decode(_DATAGEN_SCRIPT_B64).decode("utf-8")  # noqa: F821
+        with open(script_path, "w") as f:
+            f.write(script_content)
+        print(f"Wrote bundled data_generation_offline.py to {script_path}", flush=True)
+
+    try:
+        datagen_cmd = [
+            sys.executable,
+            script_path,
+            "--preprocessed-data",
+            save_path,
+            "--endpoint",
+            endpoint,
+            "--output",
+            hidden_states_dir,
+            "--concurrency",
+            str(concurrency),
+        ]
+        if max_samples is not None:
+            datagen_cmd.extend(["--max-samples", str(max_samples)])
+        print(f"Datagen command: {' '.join(datagen_cmd)}", flush=True)
+        result = subprocess.run(datagen_cmd, capture_output=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"data_generation_offline.py exited with code {result.returncode}")
+    finally:
+        if vllm_proc is not None:
+            print("Stopping vLLM server...", flush=True)
+            vllm_proc.terminate()
+            try:
+                vllm_proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                vllm_proc.kill()
+                vllm_proc.wait(timeout=10)
+
+    if os.path.exists(incomplete_marker):
+        try:
+            os.remove(incomplete_marker)
+        except Exception as e:
+            print(
+                f"Warning: Failed to remove sentinel file: {e}. "
+                f"A stale marker may cause re-extraction on next run. "
+                f"Remove it manually from: {incomplete_marker}",
+                flush=True,
+            )
+    print("=" * 60, flush=True)
+    print("DONE - Hidden states generated in ArrowDataset format", flush=True)
+    print("=" * 60, flush=True)
+
+
+def _speculator_train_only(
+    verifier_model: str,
+    hidden_states_path: str,
+    save_path: str,
+    epochs: int,
+    lr: float,
+    total_seq_len: int,
+    hidden_states_dtype: str = "bfloat16",
+    num_layers: int = 1,
+    ttt_steps: int = 3,
+    norm_before_residual: bool = True,
+    norm_before_fc: bool = False,
+    embed_requires_grad: bool = False,
+    scheduler_type: str = "linear",
+    loss_fn: str = "kl_div",
+    noise_std: float = 0.05,
+    checkpoint_freq: float = 1.0,
+    log_freq: int = 1,
+    from_pretrained: str | None = None,
+    use_off_policy_tokens: bool = False,
+    ttt_step_loss_decay: float = 1.0,
+) -> None:
+    """Training function injected into pods via inspect.getsource().
+
+    This function is NOT called directly in the SDK. It is extracted as source
+    code and injected into the training script that runs inside the container.
+    """
+    import contextlib
+    import os
+
+    from speculators.models.eagle3.core import Eagle3DraftModel
+    from speculators.models.eagle3.data import shift_batch
+    from speculators.train.data import ArrowDataset, create_collate_fn
+    from speculators.train.distributed_batch_sampler import (
+        MultipackDistributedBatchSamplerV2,
+    )
+    from speculators.train.noise_transforms import AddUniformNoise
+    from speculators.train.trainer import Trainer, TrainerConfig
+    import torch
+    from torch.utils.data import DataLoader
+    from transformers import AutoConfig
+
+    rank = int(os.environ.get("RANK", "0"))
+    marker_name = f"{EXTRACTION_INCOMPLETE_MARKER}.rank-{rank}"  # noqa: F821
+    hs_dir = os.path.join(hidden_states_path, "hidden_states")
+    own_marker = os.path.join(hs_dir, marker_name)
+    if os.path.exists(own_marker):
+        raise RuntimeError(
+            f"Incomplete data extraction detected at '{hidden_states_path}' "
+            f"for rank {rank}. "
+            "Re-run data extraction (DATA_ONLY or OFFLINE mode) before training."
+        )
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    is_distributed = int(os.environ.get("WORLD_SIZE", 1)) > 1
+    if is_distributed and not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+
+    verifier_config = AutoConfig.from_pretrained(verifier_model)
+
+    from_training_kwargs = {
+        "draft_vocab_size": verifier_config.vocab_size,
+        "num_layers": num_layers,
+        "norm_before_residual": norm_before_residual,
+        "norm_before_fc": norm_before_fc,
+        "embed_requires_grad": embed_requires_grad,
+        "ttt_steps": ttt_steps,
+        "verifier_name_or_path": verifier_model,
+    }
+    if from_pretrained is not None:
+        from_training_kwargs["from_pretrained"] = from_pretrained
+    model = Eagle3DraftModel.from_training_args(verifier_config, **from_training_kwargs)
+
+    max_len = total_seq_len
+    collate_fn = create_collate_fn(max_len, verifier_config.hidden_size)
+    hs_dtype = getattr(torch, hidden_states_dtype)
+
+    train_dataset = ArrowDataset(
+        max_len=max_len,
+        datapath=hidden_states_path,
+        split_ratio=0.9,
+        on_missing="skip",
+        transform=AddUniformNoise(),
+        hidden_states_dtype=hs_dtype,
+    )
+    val_dataset = ArrowDataset(
+        max_len=max_len,
+        datapath=hidden_states_path,
+        split_ratio=-0.1,
+        on_missing="skip",
+        hidden_states_dtype=hs_dtype,
+    )
+
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    rank = int(os.environ.get("RANK", 0))
+
+    train_batch_sampler = MultipackDistributedBatchSamplerV2(
+        batch_max_length=max_len,
+        lengths=train_dataset.approx_lengths,
+        num_replicas=world_size,
+        rank=rank,
+    )
+    val_batch_sampler = MultipackDistributedBatchSamplerV2(
+        batch_max_length=max_len,
+        lengths=val_dataset.approx_lengths,
+        num_replicas=world_size,
+        rank=rank,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_sampler=train_batch_sampler,
+        collate_fn=collate_fn,
+        num_workers=2,
+        prefetch_factor=4,
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_sampler=val_batch_sampler, collate_fn=collate_fn
+    )
+
+    with contextlib.suppress(NameError):
+        _set_steps_per_epoch(len(train_loader))  # noqa: F821
+
+    config = TrainerConfig(
+        lr=lr,
+        num_epochs=epochs,
+        save_path=save_path,
+        scheduler_type=scheduler_type,
+        loss_fn=loss_fn,
+        noise_std=noise_std,
+        checkpoint_freq=checkpoint_freq,
+        log_freq=log_freq,
+        use_off_policy_tokens=use_off_policy_tokens,
+        ttt_step_loss_decay=ttt_step_loss_decay,
+        is_distributed=is_distributed,
+        local_rank=local_rank,
+        train_call_kwargs={"shift_fn": shift_batch},
+        val_call_kwargs={"shift_fn": shift_batch},
+    )
+
+    trainer = Trainer(model, config, train_loader, val_loader)
+    trainer.run_training()
+
+
+def _render_speculator_training_script(trainer: SpeculativeDecodingTrainer) -> str:
+    """Generate a training script via inspect.getsource().
+
+    Builds the script by composing shared pieces based on what each mode needs:
+    - DATA_ONLY: data extraction only
+    - TRAIN_ONLY: training only
+    - OFFLINE: all ranks extract data, then all ranks train
+
+    Args:
+        trainer: SpeculativeDecodingTrainer configuration.
+
+    Returns:
+        Python source code string for the training script.
+    """
+    import inspect
+    import textwrap
+
+    from kubeflow.trainer.rhai.utils import parse_output_dir_uri
+
+    resolved_output_dir, _ = parse_output_dir_uri(trainer.output_dir)
+
+    needs_data = trainer.mode in (SpeculatorMode.DATA_ONLY, SpeculatorMode.OFFLINE)
+    needs_train = trainer.mode in (SpeculatorMode.TRAIN_ONLY, SpeculatorMode.OFFLINE)
+
+    cfg = trainer.config or SpeculatorConfig()
+
+    from kubeflow.trainer.rhai.constants import EXTRACTION_INCOMPLETE_MARKER
+
+    script = f"EXTRACTION_INCOMPLETE_MARKER = {EXTRACTION_INCOMPLETE_MARKER!r}\n\n"
+
+    if needs_data:
+        import base64
+        from pathlib import Path
+
+        datagen_script_path = Path(__file__).parent / "scripts" / "data_generation_offline.py"
+        datagen_b64 = base64.b64encode(datagen_script_path.read_bytes()).decode("ascii")
+
+        script += f'_DATAGEN_SCRIPT_B64 = "{datagen_b64}"\n\n'
+        script += textwrap.dedent(inspect.getsource(_speculator_data_only))
+
+    if needs_train:
+        script += textwrap.dedent(inspect.getsource(_speculator_train_only))
+
+    if trainer.dataset_name and trainer.dataset_name.startswith(PVC_URI_SCHEME):
+        resolved_dataset_name, _ = parse_output_dir_uri(trainer.dataset_name)
+    else:
+        resolved_dataset_name = trainer.dataset_name
+
+    if trainer.hidden_states_path:
+        resolved_hidden_states, _ = parse_output_dir_uri(trainer.hidden_states_path)
+    else:
+        resolved_hidden_states = resolved_output_dir
+
+    data_call = (
+        f"_speculator_data_only(\n"
+        f"    verifier_model={trainer.verifier_model!r},\n"
+        f"    dataset_name={resolved_dataset_name!r},\n"
+        f"    save_path={resolved_output_dir!r},\n"
+        f"    total_seq_len={trainer.total_seq_len!r},\n"
+        f"    max_samples={trainer.max_samples!r},\n"
+        f"    vllm_endpoint={trainer.vllm_endpoint!r},\n"
+        f"    concurrency={cfg.datagen_concurrency!r},\n"
+        f"    gpu_memory_utilization={trainer.vllm_gpu_memory_utilization!r},\n"
+        f")\n"
+    )
+
+    train_call = (
+        f"_speculator_train_only(\n"
+        f"    verifier_model={trainer.verifier_model!r},\n"
+        f"    hidden_states_path={resolved_hidden_states!r},\n"
+        f"    save_path={resolved_output_dir!r},\n"
+        f"    epochs={trainer.epochs!r},\n"
+        f"    lr={trainer.lr!r},\n"
+        f"    total_seq_len={trainer.total_seq_len!r},\n"
+        f"    hidden_states_dtype={cfg.hidden_states_dtype!r},\n"
+        f"    num_layers={cfg.num_layers!r},\n"
+        f"    ttt_steps={cfg.ttt_steps!r},\n"
+        f"    norm_before_residual={cfg.norm_before_residual!r},\n"
+        f"    norm_before_fc={cfg.norm_before_fc!r},\n"
+        f"    embed_requires_grad={cfg.embed_requires_grad!r},\n"
+        f"    scheduler_type={cfg.scheduler_type!r},\n"
+        f"    loss_fn={cfg.loss_fn!r},\n"
+        f"    noise_std={cfg.noise_std!r},\n"
+        f"    checkpoint_freq={cfg.checkpoint_freq!r},\n"
+        f"    log_freq={cfg.log_freq!r},\n"
+        f"    from_pretrained={cfg.from_pretrained!r},\n"
+        f"    use_off_policy_tokens={cfg.use_off_policy_tokens!r},\n"
+        f"    ttt_step_loss_decay={cfg.ttt_step_loss_decay!r},\n"
+        f")\n"
+    )
+
+    if trainer.mode == SpeculatorMode.DATA_ONLY:
+        script += f"\n{data_call}"
+
+    elif trainer.mode == SpeculatorMode.TRAIN_ONLY:
+        script += f"\n{train_call}"
+
+    elif trainer.mode == SpeculatorMode.OFFLINE:
+        script += f"\n{data_call}"
+        script += f"\n{train_call}"
+
+    return script
+
+
+def _create_speculator_progression_instrumentation(
+    metrics_port: int,
+    mode: str,
+    num_epochs: int = 0,
+) -> tuple:
+    """Unified instrumentation for all speculator modes (extracted via inspect.getsource).
+
+    Handles progression tracking for DATA_ONLY (file counting), TRAIN_ONLY (log
+    interception), and OFFLINE (file counting 0-50% then log interception 50-100%).
+
+    This function is NOT called directly in the SDK - it's extracted as source code
+    via inspect.getsource() and injected into training scripts.
+
+    Args:
+        metrics_port: Port for HTTP metrics server.
+        mode: Speculator mode string ("data_only", "train_only", "offline").
+        num_epochs: Total training epochs (used for train_only and offline).
+
+    Returns:
+        Tuple of (apply_fn, start_data_fn, handler_class) for testing purposes.
+    """
+    import http.server
+    import json
+    import logging
+    import os
+    import threading
+    import time
+
+    _hidden_states_dir: str | None = None
+    _total_samples: int = 0
+    _data_start_time: float | None = None
+
+    _train_start_time: float | None = None
+    _steps_per_epoch: int | None = None
+    _max_step_in_epoch0 = 0
+    _last_global_step = 0
+    _last_epoch = 0
+    _latest_metrics: dict = {}
+    _metrics_lock = threading.Lock()
+    _termination_message_written = False
+    _training_started = False
+
+    class MetricsHandler(logging.Handler):
+        """Captures speculators.metrics log records in memory."""
+
+        def emit(self, record):
+            nonlocal \
+                _steps_per_epoch, \
+                _max_step_in_epoch0, \
+                _last_global_step, \
+                _last_epoch, \
+                _latest_metrics, \
+                _training_started, \
+                _train_start_time
+            try:
+                msg = record.msg
+                if not isinstance(msg, dict):
+                    return
+                with _metrics_lock:
+                    if not _training_started:
+                        _training_started = True
+                        _train_start_time = time.time()
+                    _latest_metrics = msg
+                    if "global_step" in msg:
+                        _last_global_step = msg["global_step"]
+                    if "epoch" in msg:
+                        _last_epoch = msg["epoch"]
+                    if (
+                        _steps_per_epoch is None
+                        and "train" in msg
+                        and "epoch" in msg
+                        and "global_step" in msg
+                    ):
+                        if msg["epoch"] == 0:
+                            _max_step_in_epoch0 = max(_max_step_in_epoch0, msg["global_step"])
+                        elif msg["epoch"] >= 1 and _max_step_in_epoch0 >= 0:
+                            _steps_per_epoch = _max_step_in_epoch0 + 1
+            except (KeyError, TypeError, ValueError) as e:
+                print(f"[Kubeflow] Warning: Failed to parse metrics record: {e}", flush=True)
+
+    class SpeculatorMetricsHTTPHandler(http.server.BaseHTTPRequestHandler):
+        """HTTP handler that serves mode-aware progress to the controller."""
+
+        def do_GET(self):
+            try:
+                transformed = self._get_progress()
+            except Exception as e:
+                print(f"[Kubeflow] Failed to create progress metrics payload: {e}", flush=True)
+                self.send_error(500)
+            else:
+                self._maybe_write_termination_message(transformed)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(transformed, indent=2).encode())
+
+        def _get_progress(self):
+            if mode == "data_only":
+                return self._data_progress(scale=100, offset=0)
+            elif mode == "train_only":
+                return self._training_progress(scale=100, offset=0)
+            elif mode == "offline":
+                if not _training_started:
+                    return self._data_progress(scale=50, offset=0)
+                else:
+                    return self._training_progress(scale=50, offset=50)
+            return self._empty_response()
+
+        def _data_progress(self, scale, offset):
+            if _hidden_states_dir is None or _total_samples <= 0:
+                return self._empty_response()
+
+            try:
+                count = len(
+                    [
+                        f
+                        for f in os.listdir(_hidden_states_dir)
+                        if f.startswith("hs_") and f.endswith(".safetensors")
+                    ]
+                )
+            except FileNotFoundError:
+                count = 0
+
+            raw_pct = count / _total_samples * 100
+            progress_pct = min(offset + scale, offset + int(raw_pct * scale / 100))
+
+            estimated_remaining = None
+            if _data_start_time and count > 0:
+                elapsed = time.time() - _data_start_time
+                remaining = _total_samples - count
+                if remaining <= 0:
+                    estimated_remaining = 0
+                else:
+                    time_per_sample = elapsed / count
+                    estimated_remaining = int(remaining * time_per_sample)
+
+            return {
+                "progressPercentage": progress_pct,
+                "estimatedRemainingSeconds": estimated_remaining,
+                "currentStep": count,
+                "totalSteps": _total_samples,
+                "currentEpoch": None,
+                "totalEpochs": None,
+                "trainMetrics": None,
+                "evalMetrics": None,
+            }
+
+        def _training_progress(self, scale, offset):
+            with _metrics_lock:
+                metrics_snapshot = dict(_latest_metrics)
+
+            if not metrics_snapshot:
+                response = self._empty_response()
+                response["progressPercentage"] = offset
+                return response
+
+            global_step = metrics_snapshot.get("global_step", _last_global_step)
+            epoch = metrics_snapshot.get("epoch", _last_epoch)
+            train_metrics = metrics_snapshot.get("train", {})
+            val_metrics = metrics_snapshot.get("val", {})
+
+            total_steps = None
+            progress_pct = offset
+            estimated_remaining = None
+
+            if _steps_per_epoch and _steps_per_epoch > 0:
+                total_steps = _steps_per_epoch * num_epochs
+                if total_steps > 0:
+                    completed_steps = global_step + 1
+                    raw_pct = completed_steps / total_steps * 100
+                    progress_pct = min(offset + scale, offset + int(raw_pct * scale / 100))
+
+                    if _train_start_time and completed_steps > 0:
+                        elapsed = time.time() - _train_start_time
+                        remaining_steps = total_steps - completed_steps
+                        if remaining_steps <= 0:
+                            estimated_remaining = 0
+                        else:
+                            time_per_step = elapsed / completed_steps
+                            estimated_remaining = int(remaining_steps * time_per_step)
+
+            loss_val = train_metrics.get("loss")
+            lr_val = metrics_snapshot.get("lr")
+
+            return {
+                "progressPercentage": progress_pct,
+                "estimatedRemainingSeconds": estimated_remaining,
+                "currentStep": global_step,
+                "totalSteps": total_steps,
+                "currentEpoch": epoch + 1,
+                "totalEpochs": num_epochs,
+                "trainMetrics": {
+                    "loss": f"{loss_val:.4f}" if loss_val is not None else None,
+                    "learning_rate": f"{lr_val:.6f}" if lr_val is not None else None,
+                },
+                "evalMetrics": {
+                    k: f"{v:.4f}" if isinstance(v, (int, float)) else str(v)
+                    for k, v in val_metrics.items()
+                }
+                if val_metrics
+                else {},
+            }
+
+        def _empty_response(self):
+            return {
+                "progressPercentage": None,
+                "estimatedRemainingSeconds": None,
+                "currentStep": None,
+                "totalSteps": None,
+                "currentEpoch": None,
+                "totalEpochs": None,
+                "trainMetrics": None,
+                "evalMetrics": None,
+            }
+
+        def _maybe_write_termination_message(self, metrics):
+            nonlocal _termination_message_written
+            if _termination_message_written:
+                return
+            progress = metrics.get("progressPercentage")
+            if progress is not None and progress >= 100:
+                try:
+                    with open("/dev/termination-log", "w") as f:
+                        f.write(json.dumps(metrics))
+                    _termination_message_written = True
+                    print("[Kubeflow] Complete. Final metrics saved.", flush=True)
+                except (OSError, ValueError, TypeError) as e:
+                    print(
+                        f"[Kubeflow] Warning: Failed to write termination message: {e}. "
+                        f"Controller will fall back to HTTP polling.",
+                        flush=True,
+                    )
+
+        def log_message(self, format, *args):
+            pass
+
+    def _start_data_progress_server(hidden_states_dir, total_samples):
+        nonlocal _hidden_states_dir, _total_samples, _data_start_time
+        _hidden_states_dir = hidden_states_dir
+        _total_samples = total_samples
+        _data_start_time = time.time()
+        print(
+            f"[Kubeflow] Data progress tracking active "
+            f"({total_samples} samples in {hidden_states_dir})",
+            flush=True,
+        )
+
+    def set_steps_per_epoch(steps):
+        nonlocal _steps_per_epoch
+        _steps_per_epoch = steps
+
+    def _mark_data_complete():
+        nonlocal _training_started, _train_start_time
+        _training_started = True
+        _train_start_time = time.time()
+
+    def apply_progression_tracking():
+        if mode in ("train_only", "offline"):
+            handler = MetricsHandler()
+            metrics_logger = logging.getLogger("speculators.metrics")
+            metrics_logger.setLevel(logging.INFO)
+            metrics_logger.addHandler(handler)
+
+        try:
+            server = http.server.HTTPServer(("0.0.0.0", metrics_port), SpeculatorMetricsHTTPHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            print(f"[Kubeflow] Metrics server started on port {metrics_port}", flush=True)
+        except OSError as e:
+            print(
+                f"[Kubeflow] Warning: Failed to start metrics server on port "
+                f"{metrics_port}: {e}. Will continue without metrics server.",
+                flush=True,
+            )
+        except Exception as e:
+            print(
+                f"[Kubeflow] Warning: Unexpected error starting metrics server: {e}. "
+                f"Will continue without metrics server.",
+                flush=True,
+            )
+
+        return set_steps_per_epoch
+
+    return (
+        apply_progression_tracking,
+        _start_data_progress_server,
+        SpeculatorMetricsHTTPHandler,
+        _mark_data_complete,
+    )
+
+
+def get_speculator_instrumentation_wrapper(
+    metrics_port: int,
+    mode: str,
+    num_epochs: int = 0,
+) -> str:
+    """Generate self-contained instrumentation wrapper via inspect.getsource.
+
+    Args:
+        metrics_port: Port for HTTP metrics server.
+        mode: Speculator mode string ("data_only", "train_only", "offline").
+        num_epochs: Total training epochs.
+
+    Returns:
+        Python code as string with {{user_training_code}} placeholder.
+    """
+    import inspect
+    import textwrap
+
+    instrumentation_code = inspect.getsource(_create_speculator_progression_instrumentation)
+    instrumentation_code = textwrap.dedent(instrumentation_code)
+
+    wrapper = f"""\
+# =============================================================================
+# Kubeflow SDK - Speculator Progression Tracking Instrumentation
+# Generated by kubeflow.trainer.rhai.speculator
+# =============================================================================
+
+import os as _instr_os
+_local_rank = int(_instr_os.environ.get("LOCAL_RANK", "0"))
+
+print("[Kubeflow] Initializing speculator progression tracking", flush=True)
+
+# Instrumentation function definition
+{instrumentation_code}
+
+if _local_rank == 0:
+    # Initialize and apply instrumentation
+    (
+        _apply_progression_tracking,
+        _start_data_progress_server,
+        _,
+        _mark_data_complete,
+    ) = _create_speculator_progression_instrumentation(
+        metrics_port={metrics_port},
+        mode={mode!r},
+        num_epochs={num_epochs},
+    )
+    _set_steps_per_epoch = _apply_progression_tracking()
+    print("[Kubeflow] Speculator progression tracking enabled", flush=True)
+
+# =============================================================================
+# USER CODE
+# =============================================================================
+
+{{{{user_training_code}}}}"""
+
+    return wrapper
+
+
+def _build_install_snippet(
+    packages_to_install: list[str] | None,
+    pip_index_urls: list[str],
+) -> str:
+    """Build the shell snippet to install Python packages if requested."""
+    if not packages_to_install:
+        return ""
+    return k8s_utils.get_script_for_python_packages(
+        packages_to_install,
+        pip_index_urls,
+    )
+
+
+def _get_command_from_runtime(
+    runtime: types.Runtime,
+    func_code: str,
+    func_file: str,
+    install_snippet: str,
+) -> list[str]:
+    """Build command using runtime's command template.
+
+    Args:
+        runtime: Runtime configuration with command template.
+        func_code: The training function code to execute.
+        func_file: The filename to write the code to.
+        install_snippet: Package installation script to prepend.
+
+    Returns:
+        Command list ready for trainer_crd.command.
+    """
+    command = []
+    for c in runtime.trainer.command:
+        if "{func_file}" in c:
+            exec_script = c.format(func_code=func_code, func_file=func_file)
+            if install_snippet:
+                exec_script = install_snippet + exec_script
+            command.append(exec_script)
+        else:
+            command.append(c)
+    return command
+
+
+def get_trainer_cr_from_speculator_trainer(
+    runtime: types.Runtime,
+    trainer: SpeculativeDecodingTrainer,
+    initializer: types.Initializer | None = None,
+) -> models.TrainerV1alpha1Trainer:
+    """Build Trainer CRD for SpeculativeDecodingTrainer.
+
+    Args:
+        runtime: Runtime configuration.
+        trainer: SpeculativeDecodingTrainer configuration.
+        initializer: Optional initializer configuration.
+
+    Returns:
+        Trainer CRD spec.
+    """
+    if trainer.mode == SpeculatorMode.DATA_ONLY:
+        runtime.trainer.set_command(constants.DEFAULT_COMMAND)
+    else:
+        runtime.trainer.set_command(constants.TORCH_COMMAND)
+
+    trainer_crd = models.TrainerV1alpha1Trainer()
+
+    if trainer.num_nodes is not None:
+        trainer_crd.num_nodes = trainer.num_nodes
+
+    if trainer.mode in (
+        SpeculatorMode.TRAIN_ONLY,
+        SpeculatorMode.OFFLINE,
+        SpeculatorMode.ONLINE,
+    ):
+        trainer_crd.resources_per_node = k8s_utils.get_resources_per_node(
+            {"nvidia.com/gpu": trainer.training_gpu_count}
+        )
+
+    install_snippet = _build_install_snippet(trainer.packages_to_install, trainer.pip_index_urls)
+
+    func_code = _render_speculator_training_script(trainer)
+    func_file = "speculator_train.py"
+
+    if trainer.enable_progression_tracking:
+        wrapper_code = get_speculator_instrumentation_wrapper(
+            metrics_port=trainer.metrics_port,
+            mode=trainer.mode.value,
+            num_epochs=trainer.epochs,
+        )
+        func_code = wrapper_code.replace("{{user_training_code}}", func_code)
+
+    trainer_crd.command = _get_command_from_runtime(
+        runtime=runtime,
+        func_code=func_code,
+        func_file=func_file,
+        install_snippet=install_snippet,
+    )
+
+    trainer_crd.env = (
+        [models.IoK8sApiCoreV1EnvVar(name=k, value=v) for k, v in trainer.env.items()]
+        if trainer.env
+        else None
+    )
+
+    return trainer_crd
