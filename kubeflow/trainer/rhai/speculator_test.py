@@ -24,6 +24,7 @@ from kubeflow.trainer.rhai.speculator import (
     SpeculatorType,
     _create_speculator_progression_instrumentation,
     _render_speculator_training_script,
+    apply_speculator_sidecar_overrides,
     get_trainer_cr_from_speculator_trainer,
 )
 from kubeflow.trainer.test.common import FAILED, SUCCESS, TestCase
@@ -1506,5 +1507,127 @@ def test_data_only_script_skips_completed_extraction():
 
     assert ".safetensors" in script
     assert "Data extraction already completed. Skipping." in script
+
+    print("test execution complete")
+
+
+def test_apply_speculator_sidecar_overrides():
+    """Test sidecar overrides add correct init container config."""
+    print("Executing test: apply_speculator_sidecar_overrides")
+
+    trainer = SpeculativeDecodingTrainer(
+        verifier_model="/mnt/kubeflow-checkpoints/models/Qwen3-8B",
+        mode=SpeculatorMode.DATA_ONLY,
+        dataset_name="sharegpt",
+        output_dir="pvc://shared/speculator/run1",
+        vllm_gpu_count=2,
+        vllm_gpu_memory_utilization=0.85,
+    )
+
+    result = apply_speculator_sidecar_overrides(trainer, [])
+
+    assert len(result) == 1
+    override = result[0]
+    assert override["targetJobs"] == [{"name": "node"}]
+
+    init_containers = override["spec"]["initContainers"]
+    assert len(init_containers) == 1
+
+    sidecar = init_containers[0]
+    assert sidecar["name"] == "vllm-sidecar"
+
+    env_dict = {e["name"]: e["value"] for e in sidecar["env"]}
+    assert env_dict["SPECULATOR_VERIFIER_MODEL"] == "/mnt/kubeflow-checkpoints/models/Qwen3-8B"
+    assert (
+        env_dict["SPECULATOR_HS_PATH"] == "/mnt/kubeflow-checkpoints/speculator/run1/hidden_states"
+    )
+    assert env_dict["SPECULATOR_GPU_MEM_UTIL"] == "0.85"
+    assert env_dict["SPECULATOR_VLLM_GPU_COUNT"] == "2"
+
+    assert sidecar["volumeMounts"][0]["name"] == "checkpoint-storage"
+    assert sidecar["volumeMounts"][0]["mountPath"] == "/mnt/kubeflow-checkpoints"
+
+    assert sidecar["resources"]["limits"]["nvidia.com/gpu"] == "2"
+
+    print("test execution complete")
+
+
+def test_apply_speculator_sidecar_overrides_preserves_existing():
+    """Test sidecar overrides preserve existing pod template overrides."""
+    print("Executing test: sidecar overrides preserve existing overrides")
+
+    trainer = SpeculativeDecodingTrainer(
+        verifier_model="Qwen/Qwen3-8B",
+        mode=SpeculatorMode.DATA_ONLY,
+        dataset_name="sharegpt",
+        output_dir="pvc://shared/output",
+    )
+
+    existing = [
+        {
+            "targetJobs": [{"name": "node"}],
+            "spec": {
+                "volumes": [
+                    {"name": "checkpoint-storage", "persistentVolumeClaim": {"claimName": "shared"}}
+                ],
+                "containers": [
+                    {
+                        "name": "node",
+                        "volumeMounts": [
+                            {"name": "checkpoint-storage", "mountPath": "/mnt/kubeflow-checkpoints"}
+                        ],
+                    }
+                ],
+            },
+        }
+    ]
+
+    result = apply_speculator_sidecar_overrides(trainer, existing)
+
+    assert len(result) == 1
+    spec = result[0]["spec"]
+    assert len(spec["volumes"]) == 1
+    assert len(spec["containers"]) == 1
+    assert len(spec["initContainers"]) == 1
+    assert spec["initContainers"][0]["name"] == "vllm-sidecar"
+
+    print("test execution complete")
+
+
+def test_data_only_script_uses_sidecar_endpoint():
+    """Test DATA_ONLY script renders sidecar endpoint when no vllm_endpoint provided."""
+    print("Executing test: DATA_ONLY script uses sidecar endpoint")
+
+    trainer = SpeculativeDecodingTrainer(
+        verifier_model="Qwen/Qwen3-8B",
+        mode=SpeculatorMode.DATA_ONLY,
+        dataset_name="sharegpt",
+        output_dir="pvc://test-pvc/output",
+    )
+
+    script = _render_speculator_training_script(trainer)
+
+    assert "http://localhost:8234/v1" in script
+    assert "gpu_memory_utilization" not in script
+    assert "vllm_gpu_count" not in script
+
+    print("test execution complete")
+
+
+def test_offline_script_uses_user_endpoint():
+    """Test OFFLINE script uses user-provided vllm_endpoint."""
+    print("Executing test: OFFLINE script uses user endpoint")
+
+    trainer = SpeculativeDecodingTrainer(
+        verifier_model="Qwen/Qwen3-8B",
+        mode=SpeculatorMode.OFFLINE,
+        dataset_name="sharegpt",
+        output_dir="pvc://test-pvc/output",
+        vllm_endpoint="http://my-vllm:8000/v1",
+    )
+
+    script = _render_speculator_training_script(trainer)
+
+    assert "vllm_endpoint='http://my-vllm:8000/v1'" in script
 
     print("test execution complete")

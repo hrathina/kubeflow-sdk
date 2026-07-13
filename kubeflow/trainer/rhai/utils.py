@@ -517,6 +517,11 @@ def setup_rhai_trainer_storage(
         else:
             pod_template_overrides = pod_template_overrides or []
 
+        if trainer.mode == speculator.SpeculatorMode.DATA_ONLY and trainer.vllm_endpoint is None:
+            pod_template_overrides = speculator.apply_speculator_sidecar_overrides(
+                trainer, pod_template_overrides
+            )
+
     elif hasattr(trainer, "output_dir") and trainer.output_dir:
         resolved_output_dir, pod_template_overrides = apply_output_dir_uri_to_pod_overrides(
             trainer.output_dir, pod_template_overrides

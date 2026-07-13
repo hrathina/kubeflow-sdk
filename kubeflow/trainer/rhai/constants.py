@@ -34,3 +34,8 @@ CHECKPOINT_EPHEMERAL_VOLUME_SIZE = "50Gi"
 
 # Cloud storage URI schemes
 S3_URI_SCHEME = "s3://"
+
+# vLLM sidecar constants (for speculator DATA_ONLY mode)
+VLLM_SIDECAR_CONTAINER_NAME = "vllm-sidecar"
+VLLM_SIDECAR_PORT = 8234
+VLLM_SIDECAR_ENDPOINT = f"http://localhost:{VLLM_SIDECAR_PORT}/v1"

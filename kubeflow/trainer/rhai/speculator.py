@@ -345,21 +345,18 @@ def _speculator_data_only(
     save_path: str,
     total_seq_len: int,
     max_samples: int | None = None,
-    vllm_endpoint: str | None = None,
+    vllm_endpoint: str = "http://localhost:8234/v1",
     concurrency: int = 4,
-    gpu_memory_utilization: float = 0.9,
-    vllm_gpu_count: int = 1,
 ) -> None:
     """Data extraction function injected into pods via inspect.getsource().
 
-    Extracts hidden states from the verifier model via vLLM. When vllm_endpoint
-    is None, a managed vLLM server is launched and stopped automatically.
-    When provided, the user's existing vLLM endpoint is used directly.
+    Extracts hidden states from the verifier model via a vLLM endpoint.
+    The vLLM server is provided either by the Kubernetes sidecar container
+    (DATA_ONLY mode) or by a user-managed external deployment (OFFLINE mode).
 
     This function is NOT called directly in the SDK. It is extracted as source
     code and injected into the script that runs inside the container.
     """
-    import json
     import os
     import subprocess
     import sys
@@ -368,9 +365,6 @@ def _speculator_data_only(
     import urllib.request
 
     from speculators.data_generation.preprocessing import load_and_preprocess_dataset
-    from transformers import AutoConfig
-
-    port = 8234
 
     hidden_states_dir = os.path.join(save_path, "hidden_states")
     os.makedirs(save_path, exist_ok=True)
@@ -425,101 +419,30 @@ def _speculator_data_only(
     if "_start_data_progress_server" in globals():
         _start_data_progress_server(hidden_states_dir, len(dataset))  # noqa: F821
 
-    vllm_proc = None
-    if vllm_endpoint is None:
-        if "_set_phase" in globals():
-            _set_phase("launching_vllm", 10)  # noqa: F821
+    if "_set_phase" in globals():
+        _set_phase("checking_vllm", 10)  # noqa: F821
 
-        print("=" * 60, flush=True)
-        print("Stage 2: Launching vLLM server", flush=True)
-        print("=" * 60, flush=True)
-
-        config = AutoConfig.from_pretrained(verifier_model)
-        if hasattr(config, "text_config"):
-            config = config.text_config
-        num_layers = config.num_hidden_layers
-        target_layer_ids = [2, num_layers // 2, num_layers - 3]
-        extraction_layer_ids = list(target_layer_ids)
-        if num_layers not in extraction_layer_ids:
-            extraction_layer_ids.append(num_layers)
-
-        speculative_config = {
-            "method": "extract_hidden_states",
-            "num_speculative_tokens": 1,
-            "draft_model_config": {
-                "hf_config": {"eagle_aux_hidden_state_layer_ids": extraction_layer_ids}
-            },
-        }
-        kv_transfer_config = {
-            "kv_connector": "ExampleHiddenStatesConnector",
-            "kv_role": "kv_producer",
-            "kv_connector_extra_config": {"shared_storage_path": hidden_states_dir},
-        }
-
-        vllm_cmd = [
-            sys.executable,
-            "-m",
-            "vllm.entrypoints.cli.main",
-            "serve",
-            verifier_model,
-            "--speculative_config",
-            json.dumps(speculative_config),
-            "--kv_transfer_config",
-            json.dumps(kv_transfer_config),
-            "--port",
-            str(port),
-            "--gpu-memory-utilization",
-            str(gpu_memory_utilization),
-            "--max-model-len",
-            str(total_seq_len + 1),
-            "--tensor-parallel-size",
-            str(vllm_gpu_count),
-            "--no-enable-chunked-prefill",
-        ]
-        print(f"vLLM command: {' '.join(vllm_cmd)}", flush=True)
-        vllm_proc = subprocess.Popen(vllm_cmd, stdout=sys.stdout, stderr=sys.stderr)
-
-        endpoint = f"http://localhost:{port}/v1"
-        health_url = f"http://localhost:{port}/health"
-        timeout_secs = 600
-        start = time.time()
-        print(f"Waiting for vLLM server (timeout={timeout_secs}s)...", flush=True)
-        while time.time() - start < timeout_secs:
-            if vllm_proc.poll() is not None:
-                raise RuntimeError(f"vLLM process died with exit code {vllm_proc.returncode}")
-            try:
-                req = urllib.request.Request(health_url)
-                resp = urllib.request.urlopen(req, timeout=5)
-                if resp.status == 200:
-                    print(f"vLLM server ready at {endpoint}", flush=True)
-                    break
-            except (urllib.error.URLError, OSError):
-                time.sleep(5)
-        else:
-            vllm_proc.kill()
-            raise RuntimeError(f"vLLM server did not start within {timeout_secs}s")
+    endpoint = vllm_endpoint
+    print(f"Using vLLM endpoint: {endpoint}", flush=True)
+    health = vllm_endpoint.rstrip("/").rsplit("/v1", 1)[0] + "/health"
+    timeout_secs = 300
+    start = time.time()
+    print(f"Waiting for vLLM server (timeout={timeout_secs}s)...", flush=True)
+    while time.time() - start < timeout_secs:
+        try:
+            urllib.request.urlopen(health, timeout=5)
+            print("vLLM ready", flush=True)
+            break
+        except (urllib.error.URLError, OSError):
+            time.sleep(5)
     else:
-        if "_set_phase" in globals():
-            _set_phase("checking_vllm", 10)  # noqa: F821
-
-        endpoint = vllm_endpoint
-        print(f"Using external vLLM endpoint: {endpoint}", flush=True)
-        health = vllm_endpoint.rstrip("/").rsplit("/v1", 1)[0] + "/health"
-        for _i in range(3):
-            try:
-                urllib.request.urlopen(health, timeout=2)
-                print("vLLM ready", flush=True)
-                break
-            except Exception:
-                time.sleep(5)
-        else:
-            sys.exit("vLLM endpoint not reachable")
+        sys.exit(f"vLLM endpoint not reachable within {timeout_secs}s")
 
     if "_set_phase" in globals():
         _set_phase("extracting", 10)  # noqa: F821
 
     print("=" * 60, flush=True)
-    print("Stage 3: Generating hidden states", flush=True)
+    print("Stage 2: Generating hidden states", flush=True)
     print("=" * 60, flush=True)
 
     script_path = "/tmp/data_generation_offline.py"
@@ -531,41 +454,31 @@ def _speculator_data_only(
             f.write(script_content)
         print(f"Wrote bundled data_generation_offline.py to {script_path}", flush=True)
 
-    try:
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        datagen_cmd = [
-            sys.executable,
-            script_path,
-            "--model",
-            verifier_model,
-            "--preprocessed-data",
-            save_path,
-            "--endpoint",
-            endpoint,
-            "--output",
-            hidden_states_dir,
-            "--concurrency",
-            str(concurrency),
-            "--world-size",
-            str(world_size),
-            "--rank",
-            str(rank),
-        ]
-        if max_samples is not None:
-            datagen_cmd.extend(["--max-samples", str(max_samples)])
-        print(f"Datagen command: {' '.join(datagen_cmd)}", flush=True)
-        result = subprocess.run(datagen_cmd, capture_output=False)
-        if result.returncode != 0:
-            raise RuntimeError(f"data_generation_offline.py exited with code {result.returncode}")
-    finally:
-        if vllm_proc is not None:
-            print("Stopping vLLM server...", flush=True)
-            vllm_proc.terminate()
-            try:
-                vllm_proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                vllm_proc.kill()
-                vllm_proc.wait(timeout=10)
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    datagen_cmd = [
+        sys.executable,
+        script_path,
+        "--model",
+        verifier_model,
+        "--preprocessed-data",
+        save_path,
+        "--endpoint",
+        endpoint,
+        "--output",
+        hidden_states_dir,
+        "--concurrency",
+        str(concurrency),
+        "--world-size",
+        str(world_size),
+        "--rank",
+        str(rank),
+    ]
+    if max_samples is not None:
+        datagen_cmd.extend(["--max-samples", str(max_samples)])
+    print(f"Datagen command: {' '.join(datagen_cmd)}", flush=True)
+    result = subprocess.run(datagen_cmd, capture_output=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"data_generation_offline.py exited with code {result.returncode}")
 
     if os.path.exists(incomplete_marker):
         try:
@@ -793,6 +706,13 @@ def _render_speculator_training_script(trainer: SpeculativeDecodingTrainer) -> s
     else:
         resolved_hidden_states = resolved_output_dir
 
+    if trainer.mode == SpeculatorMode.DATA_ONLY:
+        from kubeflow.trainer.rhai.constants import VLLM_SIDECAR_ENDPOINT
+
+        data_vllm_endpoint = VLLM_SIDECAR_ENDPOINT
+    else:
+        data_vllm_endpoint = trainer.vllm_endpoint
+
     data_call = (
         f"_speculator_data_only(\n"
         f"    verifier_model={trainer.verifier_model!r},\n"
@@ -800,10 +720,8 @@ def _render_speculator_training_script(trainer: SpeculativeDecodingTrainer) -> s
         f"    save_path={resolved_output_dir!r},\n"
         f"    total_seq_len={trainer.total_seq_len!r},\n"
         f"    max_samples={trainer.max_samples!r},\n"
-        f"    vllm_endpoint={trainer.vllm_endpoint!r},\n"
+        f"    vllm_endpoint={data_vllm_endpoint!r},\n"
         f"    concurrency={cfg.datagen_concurrency!r},\n"
-        f"    gpu_memory_utilization={trainer.vllm_gpu_memory_utilization!r},\n"
-        f"    vllm_gpu_count={trainer.vllm_gpu_count!r},\n"
         f")\n"
     )
 
@@ -1250,6 +1168,77 @@ def _get_command_from_runtime(
         else:
             command.append(c)
     return command
+
+
+def apply_speculator_sidecar_overrides(
+    trainer: SpeculativeDecodingTrainer,
+    pod_template_overrides: list,
+) -> list:
+    """Configure the vLLM sidecar init container via pod template overrides.
+
+    Sets environment variables, PVC volume mount, and GPU resources on the
+    ``vllm-sidecar`` init container defined in the ClusterTrainingRuntime.
+
+    Args:
+        trainer: SpeculativeDecodingTrainer with model path, GPU settings, and output_dir.
+        pod_template_overrides: Existing pod template overrides list (mutated in place).
+
+    Returns:
+        Updated pod_template_overrides list.
+    """
+    from kubeflow.trainer.rhai.constants import (
+        CHECKPOINT_MOUNT_PATH,
+        CHECKPOINT_VOLUME_NAME,
+        VLLM_SIDECAR_CONTAINER_NAME,
+    )
+    from kubeflow.trainer.rhai.utils import parse_output_dir_uri
+
+    resolved_output_dir, _ = parse_output_dir_uri(trainer.output_dir)
+    hs_path = f"{resolved_output_dir}/hidden_states"
+
+    node_override = None
+    for override in pod_template_overrides:
+        target_jobs = override.get("targetJobs", [])
+        if any(job.get("name") == constants.NODE for job in target_jobs):
+            node_override = override
+            break
+
+    if node_override is None:
+        node_override = {"targetJobs": [{"name": constants.NODE}], "spec": {}}
+        pod_template_overrides.append(node_override)
+
+    if "spec" not in node_override:
+        node_override["spec"] = {}
+    spec_dict = node_override["spec"]
+
+    if "initContainers" not in spec_dict:
+        spec_dict["initContainers"] = []
+
+    sidecar_override = {
+        "name": VLLM_SIDECAR_CONTAINER_NAME,
+        "env": [
+            {"name": "SPECULATOR_VERIFIER_MODEL", "value": trainer.verifier_model},
+            {"name": "SPECULATOR_HS_PATH", "value": hs_path},
+            {
+                "name": "SPECULATOR_GPU_MEM_UTIL",
+                "value": str(trainer.vllm_gpu_memory_utilization),
+            },
+            {"name": "SPECULATOR_VLLM_GPU_COUNT", "value": str(trainer.vllm_gpu_count)},
+        ],
+        "volumeMounts": [
+            {
+                "name": CHECKPOINT_VOLUME_NAME,
+                "mountPath": CHECKPOINT_MOUNT_PATH,
+                "readOnly": False,
+            }
+        ],
+        "resources": {
+            "limits": {"nvidia.com/gpu": str(trainer.vllm_gpu_count)},
+        },
+    }
+    spec_dict["initContainers"].append(sidecar_override)
+
+    return pod_template_overrides
 
 
 def get_trainer_cr_from_speculator_trainer(
