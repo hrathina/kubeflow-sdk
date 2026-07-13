@@ -1270,7 +1270,7 @@ def apply_speculator_sidecar_overrides(
     else:
         from transformers import AutoConfig
 
-        model_config = AutoConfig.from_pretrained(trainer.verifier_model, trust_remote_code=True)
+        model_config = AutoConfig.from_pretrained(resolved_verifier, trust_remote_code=True)
         if hasattr(model_config, "text_config"):
             model_config = model_config.text_config
         n = model_config.num_hidden_layers
