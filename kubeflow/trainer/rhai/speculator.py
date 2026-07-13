@@ -402,6 +402,9 @@ def _speculator_data_only(
             flush=True,
         )
 
+    if "_set_phase" in globals():
+        _set_phase("preprocessing", 5)  # noqa: F821
+
     print("=" * 60, flush=True)
     print("Stage 1: Preprocessing dataset", flush=True)
     print("=" * 60, flush=True)
@@ -424,6 +427,9 @@ def _speculator_data_only(
 
     vllm_proc = None
     if vllm_endpoint is None:
+        if "_set_phase" in globals():
+            _set_phase("launching_vllm", 10)  # noqa: F821
+
         print("=" * 60, flush=True)
         print("Stage 2: Launching vLLM server", flush=True)
         print("=" * 60, flush=True)
@@ -493,6 +499,9 @@ def _speculator_data_only(
             vllm_proc.kill()
             raise RuntimeError(f"vLLM server did not start within {timeout_secs}s")
     else:
+        if "_set_phase" in globals():
+            _set_phase("checking_vllm", 10)  # noqa: F821
+
         endpoint = vllm_endpoint
         print(f"Using external vLLM endpoint: {endpoint}", flush=True)
         health = vllm_endpoint.rstrip("/").rsplit("/v1", 1)[0] + "/health"
@@ -505,6 +514,9 @@ def _speculator_data_only(
                 time.sleep(5)
         else:
             sys.exit("vLLM endpoint not reachable")
+
+    if "_set_phase" in globals():
+        _set_phase("extracting", 10)  # noqa: F821
 
     print("=" * 60, flush=True)
     print("Stage 3: Generating hidden states", flush=True)
@@ -565,6 +577,9 @@ def _speculator_data_only(
                 f"Remove it manually from: {incomplete_marker}",
                 flush=True,
             )
+    if "_set_phase" in globals():
+        _set_phase("complete", 100)  # noqa: F821
+
     print("=" * 60, flush=True)
     print("DONE - Hidden states generated in ArrowDataset format", flush=True)
     print("=" * 60, flush=True)
@@ -600,6 +615,9 @@ def _speculator_train_only(
     """
     import contextlib
     import os
+
+    if "_set_phase" in globals():
+        _set_phase("initializing", 0)  # noqa: F821
 
     from speculators.models.eagle3.core import Eagle3DraftModel
     from speculators.models.eagle3.data import shift_batch
@@ -712,8 +730,14 @@ def _speculator_train_only(
         log_freq=log_freq,
     )
 
+    if "_set_phase" in globals():
+        _set_phase("training", 15)  # noqa: F821
+
     trainer = Trainer(model, config, train_loader, val_loader)
     trainer.run_training()
+
+    if "_set_phase" in globals():
+        _set_phase("complete", 100)  # noqa: F821
 
 
 def _render_speculator_training_script(trainer: SpeculativeDecodingTrainer) -> str:
@@ -862,6 +886,8 @@ def _create_speculator_progression_instrumentation(
     _latest_metrics: dict = {}
     _metrics_lock = threading.Lock()
     _termination_message_written = False
+    _current_phase: str | None = None
+    _phase_floor_pct: int = 0
     _training_started = False
 
     class MetricsHandler(logging.Handler):
@@ -947,6 +973,7 @@ def _create_speculator_progression_instrumentation(
 
             raw_pct = count / _total_samples * 100
             progress_pct = min(offset + scale, offset + int(raw_pct * scale / 100))
+            progress_pct = max(progress_pct, _phase_floor_pct)
 
             estimated_remaining = None
             if _data_start_time and count > 0:
@@ -965,6 +992,7 @@ def _create_speculator_progression_instrumentation(
                 "totalSteps": _total_samples,
                 "currentEpoch": None,
                 "totalEpochs": None,
+                "currentPhase": _current_phase,
                 "trainMetrics": None,
                 "evalMetrics": None,
             }
@@ -975,7 +1003,7 @@ def _create_speculator_progression_instrumentation(
 
             if not metrics_snapshot:
                 response = self._empty_response()
-                response["progressPercentage"] = offset
+                response["progressPercentage"] = max(offset, _phase_floor_pct)
                 return response
 
             global_step = metrics_snapshot.get("global_step", _last_global_step)
@@ -993,6 +1021,7 @@ def _create_speculator_progression_instrumentation(
                     completed_steps = global_step + 1
                     raw_pct = completed_steps / total_steps * 100
                     progress_pct = min(offset + scale, offset + int(raw_pct * scale / 100))
+                    progress_pct = max(progress_pct, _phase_floor_pct)
 
                     if _train_start_time and completed_steps > 0:
                         elapsed = time.time() - _train_start_time
@@ -1013,6 +1042,7 @@ def _create_speculator_progression_instrumentation(
                 "totalSteps": total_steps,
                 "currentEpoch": epoch + 1,
                 "totalEpochs": num_epochs,
+                "currentPhase": _current_phase,
                 "trainMetrics": {
                     "loss": f"{loss_val:.4f}" if loss_val is not None else None,
                     "learning_rate": f"{lr_val:.6f}" if lr_val is not None else None,
@@ -1027,12 +1057,13 @@ def _create_speculator_progression_instrumentation(
 
         def _empty_response(self):
             return {
-                "progressPercentage": None,
+                "progressPercentage": _phase_floor_pct if _phase_floor_pct > 0 else None,
                 "estimatedRemainingSeconds": None,
                 "currentStep": None,
                 "totalSteps": None,
                 "currentEpoch": None,
                 "totalEpochs": None,
+                "currentPhase": _current_phase,
                 "trainMetrics": None,
                 "evalMetrics": None,
             }
@@ -1078,6 +1109,11 @@ def _create_speculator_progression_instrumentation(
         _training_started = True
         _train_start_time = time.time()
 
+    def _set_phase(phase: str, floor_pct: int = 0):
+        nonlocal _current_phase, _phase_floor_pct
+        _current_phase = phase
+        _phase_floor_pct = floor_pct
+
     def apply_progression_tracking():
         if mode in ("train_only", "offline"):
             handler = MetricsHandler()
@@ -1110,6 +1146,7 @@ def _create_speculator_progression_instrumentation(
         _start_data_progress_server,
         SpeculatorMetricsHTTPHandler,
         _mark_data_complete,
+        _set_phase,
     )
 
 
@@ -1155,6 +1192,7 @@ if _local_rank == 0:
         _start_data_progress_server,
         _,
         _mark_data_complete,
+        _set_phase,
     ) = _create_speculator_progression_instrumentation(
         metrics_port={metrics_port},
         mode={mode!r},

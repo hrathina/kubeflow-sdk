@@ -815,7 +815,7 @@ def test_progression_instrumentation_returns_callable():
     """Test that _create_speculator_progression_instrumentation returns valid tuple."""
     print("Executing test: Progression instrumentation returns callable")
 
-    apply_fn, start_data_fn, handler_class, _ = _create_speculator_progression_instrumentation(
+    apply_fn, start_data_fn, handler_class, _, _ = _create_speculator_progression_instrumentation(
         metrics_port=28080,
         mode="train_only",
         num_epochs=3,
@@ -832,7 +832,7 @@ def test_progression_instrumentation_schema_transform():
     """Test that the HTTP handler transforms speculators metrics to controller schema."""
     print("Executing test: Progression instrumentation schema transform")
 
-    _, _, handler_class, _ = _create_speculator_progression_instrumentation(
+    _, _, handler_class, _, _ = _create_speculator_progression_instrumentation(
         metrics_port=28080,
         mode="train_only",
         num_epochs=3,
@@ -1223,7 +1223,7 @@ def test_data_progression_returns_callable():
     """Test that unified instrumentation in data_only mode returns valid tuple."""
     print("Executing test: Data progression instrumentation returns callable")
 
-    apply_fn, start_fn, handler_class, _ = _create_speculator_progression_instrumentation(
+    apply_fn, start_fn, handler_class, _, _ = _create_speculator_progression_instrumentation(
         metrics_port=28080,
         mode="data_only",
     )
@@ -1239,7 +1239,7 @@ def test_data_progression_handler_counts_files(tmp_path):
     """Test that handler counts hs_*.safetensors files in data_only mode."""
     print("Executing test: Data progression handler counts files")
 
-    _, start_fn, handler_class, _ = _create_speculator_progression_instrumentation(
+    _, start_fn, handler_class, _, _ = _create_speculator_progression_instrumentation(
         metrics_port=28080,
         mode="data_only",
     )
@@ -1270,7 +1270,7 @@ def test_data_progression_handler_empty_dir(tmp_path):
     """Test that handler returns 0% when no hidden states files exist."""
     print("Executing test: Data progression handler empty directory")
 
-    _, start_fn, handler_class, _ = _create_speculator_progression_instrumentation(
+    _, start_fn, handler_class, _, _ = _create_speculator_progression_instrumentation(
         metrics_port=28080,
         mode="data_only",
     )
@@ -1295,7 +1295,7 @@ def test_data_progression_handler_complete(tmp_path):
     """Test that handler returns 100% when all files are generated."""
     print("Executing test: Data progression handler complete")
 
-    _, start_fn, handler_class, _ = _create_speculator_progression_instrumentation(
+    _, start_fn, handler_class, _, _ = _create_speculator_progression_instrumentation(
         metrics_port=28080,
         mode="data_only",
     )
@@ -1321,7 +1321,7 @@ def test_data_progression_handler_not_started():
     """Test that handler returns nulls when data tracking not yet started."""
     print("Executing test: Data progression handler not started")
 
-    _, _, handler_class, _ = _create_speculator_progression_instrumentation(
+    _, _, handler_class, _, _ = _create_speculator_progression_instrumentation(
         metrics_port=28080,
         mode="data_only",
     )
@@ -1340,7 +1340,7 @@ def test_offline_progression_data_phase(tmp_path):
     """Test that OFFLINE mode shows 0-50% during data extraction."""
     print("Executing test: OFFLINE progression data phase")
 
-    _, start_fn, handler_class, _ = _create_speculator_progression_instrumentation(
+    _, start_fn, handler_class, _, _ = _create_speculator_progression_instrumentation(
         metrics_port=28080,
         mode="offline",
         num_epochs=3,
